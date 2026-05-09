@@ -79,7 +79,7 @@ Entity(model="cube", color=color.gray,
        unlit=True, edge_color=color.black, edge_width=2)
 
 # ── Estaciones (Overcooked) ───────────────────────────────────────────
-OBJ_Y = FLOOR_Y + 0.75
+OBJ_Y = FLOOR_Y + 0.5  # bottom of cube touches floor
 
 def station(pos, clr, label):
     Entity(model="cube", color=clr, position=(pos[0], OBJ_Y, pos[2]),
@@ -91,6 +91,7 @@ station((1, 0, -2),  color.red,    "TOMATE")
 station((2, 0, -2),  color.green,  "LECHUGA")
 station((-2, 0, -2), color.yellow, "CORTE")
 station((-2, 0, -1), color.brown,  "ENSAMBLE")
+station((-2, 0, 0),  color.white,  "PLATOS")
 station((2, 0, 1),   color.azure,  "ENTREGA")
 
 # ── UI Leyenda ────────────────────────────────────────────────────────
@@ -98,6 +99,7 @@ leyenda = ("<red>Rojo:<default> Tomate\n"
            "<green>Verde:<default> Lechuga\n"
            "<yellow>Amarillo:<default> Corte\n"
            "<brown>Cafe:<default> Ensamble\n"
+           "Blanco: Platos\n"
            "<azure>Azul:<default> Entrega\n"
            "Gris: Pared")
 Text(text=leyenda, position=(0.55, 0.42), origin=(-0.5, 0.5),
