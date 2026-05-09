@@ -129,7 +129,7 @@ class PhysicsWorld:
 class Robot:
     def __init__(self, pw, rid, role, start):
         self.pw = pw; self.rid = rid; self.role = role
-        self.start = start; self.action = "idle"; self.carry = None
+        self.start = start; self.action = "idle"; self.carrying = None
         self.station = "pasillo"
         self.body = pw.box((0.4, 0.35, 0.5), 3.0, (start.x, start.y, start.z),
                            ldamp=0.5, adamp=0.9)
@@ -144,7 +144,7 @@ class Robot:
 
     def sync(self):
         p = self.pw.pos(self.body); self.vis.position = Vec3(p[0], p[1], p[2])
-        self.dot.enabled = self.carry is not None
+        self.dot.enabled = self.carrying is not None
 
     def move_to(self, target):
         pp = self.pos(); dx = target.x - pp.x; dz = target.z - pp.z
@@ -165,20 +165,20 @@ class Robot:
                                 angularVelocity=(0,0,0), physicsClientId=self.pw.cli)
 
     def pickup(self, ing):
-        self.carry = ing; ing.held = self; self.action = "carrying"
+        self.carrying = ing; ing.held = self; self.action = "carrying"
         ing.vis.parent = self.vis; ing.vis.position = Vec3(0, 1.2, 0)
 
     def drop(self, wpos):
-        if self.carry:
-            self.carry.vis.parent = None; self.carry.held = None
-            self.pw.reset(self.carry.body, (wpos.x, wpos.y+0.3, wpos.z))
-            self.carry.vis.position = Vec3(wpos.x, wpos.y+0.3, wpos.z)
-            self.carry = None
+        if self.carrying:
+            self.carrying.vis.parent = None; self.carrying.held = None
+            self.pw.reset(self.carrying.body, (wpos.x, wpos.y+0.3, wpos.z))
+            self.carrying.vis.position = Vec3(wpos.x, wpos.y+0.3, wpos.z)
+            self.carrying = None
         self.action = "idle"
 
     def reset(self):
-        if self.carry:
-            self.carry.vis.parent = None; self.carry.held = None; self.carry = None
+        if self.carrying:
+            self.carrying.vis.parent = None; self.carrying.held = None; self.carrying = None
         self.action = "idle"; self.station = "pasillo"
         self.pw.reset(self.body, (self.start.x, self.start.y, self.start.z))
         self.vis.position = self.start
@@ -431,7 +431,7 @@ def _state():
     for r in robots:
         pp = r.pos()
         rs.append({"id":r.rid,"role":r.role,"pos":[round(pp.x,2),round(pp.z,2)],
-                   "carrying":r.carry.itype if r.carry else None,
+                   "carrying":r.carrying.itype if r.carrying else None,
                    "station":r.station,"action":r.action})
     igs = []
     for i in ingredients:
