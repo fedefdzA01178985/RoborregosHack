@@ -315,7 +315,17 @@ class Scenario:
         self.body_refs = {}  # {"corte": pybullet_id, ...}
         self.obstacle_vis = []  # lista de Entity
         self.obstacle_body = [] # lista de pybullet_id
-        self._current = GeminiAgent()._default_scenario()
+        self._current = {
+            "stations": {
+                "almacen_tomate":  [1.0, -2.0],
+                "almacen_lechuga": [2.0, -2.0],
+                "corte":           [-2.0, -2.0],
+                "ensamblaje":      [-2.0, -1.0],
+                "platos":          [-2.0, 0.0],
+                "entrega":         [2.0, 1.0],
+            },
+            "obstacles": []
+        }
 
     def set_refs(self, vis, texts, bodies):
         self.vis_refs = vis
