@@ -45,6 +45,7 @@ BOT_RADIUS = 0.26
 WALL_MARGIN   = 0.30
 # Pared gris: scale_x=0.1 → half-extent=0.05. Con radio del bot + margen de seguridad:
 GRAY_X_MARGIN = 0.05 + BOT_RADIUS + 0.05   # ≈ 0.36
+gray_wall_center_x = 0.0
 GRAY_Z_MIN, GRAY_Z_MAX = -2.5, 0.0
 
 # Parámetros del danger map
@@ -65,7 +66,7 @@ def _build_grids(station_positions=None):
             if (wx < -half + WALL_MARGIN or wx > half - WALL_MARGIN or
                     wz < -half + WALL_MARGIN or wz > half - WALL_MARGIN):
                 blocked[r][c] = True
-            elif abs(wx) < GRAY_X_MARGIN and GRAY_Z_MIN <= wz <= GRAY_Z_MAX:
+            elif abs(wx - gray_wall_center_x) < GRAY_X_MARGIN and GRAY_Z_MIN <= wz <= GRAY_Z_MAX:
                 blocked[r][c] = True
 
     # Bloquear celdas ocupadas por estaciones (scale=0.7 → half=0.35)
@@ -262,10 +263,9 @@ def push_out_of_obstacles(bot_pos):
 def push_out_of_gray_wall(bot_pos):
     """Evitar que el bot atraviese la pared gris interna."""
     px, pz = bot_pos.x, bot_pos.z
-    # Pared: x ∈ [-0.05, 0.05], z ∈ [-2.5, 0.0]
     expand_x = 0.05 + BOT_RADIUS
-    if abs(px) < expand_x and GRAY_Z_MIN - BOT_RADIUS < pz < GRAY_Z_MAX + BOT_RADIUS:
-        px = expand_x * (1 if px >= 0 else -1)
+    if abs(px - gray_wall_center_x) < expand_x and GRAY_Z_MIN - BOT_RADIUS < pz < GRAY_Z_MAX + BOT_RADIUS:
+        px = gray_wall_center_x + expand_x * (1 if px >= gray_wall_center_x else -1)
     return Vec3(px, bot_pos.y, pz)
 
 # ──────────────────────────────────────────────────────────────
@@ -911,38 +911,68 @@ def randomize_scenario():
     global NAV_GRID, DANGER_GRID, static_obstacles
     global tiempo_restante, juego_activo, pedidos_completados, score
     global cola_corte, cola_ensamblaje, cola_platos, plato_actual, all_ingredientes
+    global gray_wall_center_x, GRAY_Z_MIN, GRAY_Z_MAX
 
     import random
-    margin = 0.8
-    gray_margin_x = 0.5
-    candidates = []
+
+    # ── Randomizar pared gris interna ──
+    gray_wall_center_x = random.choice([-1.6, -0.8, 0.0, 0.8, 1.6])
+    gray_span = random.uniform(1.5, min(4.0, size - 0.5))
+    GRAY_Z_MIN = round(random.uniform(-half + 0.3, half - 0.3 - gray_span), 2)
+    GRAY_Z_MAX = round(GRAY_Z_MIN + gray_span, 2)
+    gray_wall.position = (gray_wall_center_x, -half + 2.5, (GRAY_Z_MIN + GRAY_Z_MAX) / 2)
+    gray_wall.scale = (0.1, 5, gray_span)
+
+    # ── Generar estaciones pegadas a paredes exteriores ──
+    margin = 0.5
+    border = half - margin          # 2.0
     step = 0.8
-    xs = [round(i*step,2) for i in range(int(-2.2/step), int(2.2/step)+1)]
-    zs = [round(i*step,2) for i in range(int(-2.2/step), int(2.2/step)+1)]
-    for x in xs:
-        for z in zs:
-            if abs(x) < gray_margin_x and -2.5 <= z <= 0.5:
-                continue
-            if abs(x) > half - margin or abs(z) > half - margin:
-                continue
-            candidates.append((x, z))
+    coords = [round(i * step, 2) for i in range(-2, 3)]   # [-1.6, -0.8, 0.0, 0.8, 1.6]
+    candidates = []
+    for c in coords:
+        candidates.append((c,  border))   # norte
+        candidates.append((c, -border))   # sur
+        candidates.append(( border, c))   # este
+        candidates.append((-border, c))   # oeste
+    # Hacer únicos
+    seen = set()
+    unique = []
+    for cand in candidates:
+        if cand not in seen:
+            seen.add(cand)
+            unique.append(cand)
+    candidates = unique
     random.shuffle(candidates)
 
+    # Filtrar candidatos que no choquen con la pared gris
+    st_half = STATION_SCALE * 0.5
+    safe = st_half + 0.05 + 0.3       # ~0.7
+    filtered = []
+    for x, z in candidates:
+        too_close = False
+        if abs(x - gray_wall_center_x) < safe:
+            if (z > GRAY_Z_MIN - safe) and (z < GRAY_Z_MAX + safe):
+                too_close = True
+        if not too_close:
+            filtered.append((x, z))
+
     spots = []
-    for cand in candidates:
+    for cand in filtered:
         ok = True
         for s in spots:
-            if ((cand[0]-s[0])**2 + (cand[1]-s[1])**2)**0.5 < 1.0:
+            if ((cand[0] - s[0]) ** 2 + (cand[1] - s[1]) ** 2) ** 0.5 < 1.0:
                 ok = False
                 break
         if ok:
             spots.append(cand)
         if len(spots) >= 6:
             break
+
     if len(spots) < 6:
+        # Fallback fijo en bordes
         spots = [
-            ( 1.0, -2.0), ( 2.0, -2.0), (-2.0, -2.0),
-            (-2.0, -1.0), (-2.0,  0.0), ( 2.0,  1.0),
+            ( 1.6,  border), (-0.8,  border), ( 0.8, -border),
+            (-1.6, -border), ( border, 0.8),  (-border, -0.8),
         ]
 
     def _set_station(st_entity, new_pos):
