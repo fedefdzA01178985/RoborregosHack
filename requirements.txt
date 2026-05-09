@@ -2,8 +2,4 @@
 # Instalar con: pip install -r requirements.txt
 
 ursina>=5.0.0
-pybullet>=3.2.7
-google-generativeai>=0.8.0
-python-dotenv>=1.0.0
-numpy>=1.24.0
 pillow>=10.0.0
