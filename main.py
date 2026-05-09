@@ -86,7 +86,6 @@ class PhysicsWorld:
         p.setGravity(0, -9.81, 0, physicsClientId=self.cli)
         p.setTimeStep(self.STEP, physicsClientId=self.cli)
         p.setPhysicsEngineParameter(numSolverIterations=50, numSubSteps=4, physicsClientId=self.cli)
-        p.loadURDF("plane.urdf", physicsClientId=self.cli)
         print(f"[Physics] cli={self.cli}")
 
     def step(self): p.stepSimulation(physicsClientId=self.cli)
@@ -357,11 +356,19 @@ pivot.rotation_x, pivot.rotation_y = 35, 45
 
 # ── Física ───────────────────────────────────────────────────────────────────
 pw = PhysicsWorld()
-hw = WALL_H/2; h = ARENA_HALF
-for wx, wz in [(h+0.15,0), (-(h+0.15),0), (0,h+0.15), (0,-(h+0.15))]:
-    hx, hz = (0.15, h+0.15) if wx==0 else (h+0.15, 0.15)
-    pw.box((hx, hw, hz), 0, (wx, hw, wz))
-pw.box((0.05, 2.5, 1.25), 0, (0, 2.5, -1.25))
+hw = WALL_H/2  # 2.5
+
+# Piso físico en y = -2.5 (misma altura que el quad visual)
+pw.box((ARENA_HALF + 0.5, 0.1, ARENA_HALF + 0.5), 0, (0, FLOOR_Y - 0.1, 0))
+
+# Paredes perimetrales (física alineada con visual: centro y=0, altura 5)
+for wx, wz in [(ARENA_HALF + 0.15, 0), (-(ARENA_HALF + 0.15), 0),
+               (0, ARENA_HALF + 0.15), (0, -(ARENA_HALF + 0.15))]:
+    hx, hz = (0.15, ARENA_HALF + 0.15) if wx == 0 else (ARENA_HALF + 0.15, 0.15)
+    pw.box((hx, hw, hz), 0, (wx, 0, wz))
+
+# Pared interna (física alineada con visual: centro y=0)
+pw.box((0.05, hw, 1.25), 0, (0, 0, -1.25))
 
 # ── Robots ───────────────────────────────────────────────────────────────────
 roles = ["recolector","cortador","ensamblador","repartidor"]
