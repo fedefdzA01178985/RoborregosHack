@@ -1,14 +1,16 @@
 from ursina import *
 from enum import Enum, auto
-import heapq
+import heapq, math
 
 app = Ursina()
 
-# --- CONFIGURACIÓN ---
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
 size = 5
 half = size / 2
 
-# ── Texturas procedurales (no requieren archivos externos) ──────────────────
+# ── Texturas procedurales ────────────────────────────────────────────────────
 from PIL import Image, ImageDraw
 
 def _gen_tex(bg_rgba, line_rgba, grid_size=5, res=512):
@@ -24,51 +26,88 @@ def _gen_tex(bg_rgba, line_rgba, grid_size=5, res=512):
 wall_tex  = _gen_tex((130,155,185,255), (210,220,235,200), grid_size=5)
 floor_tex = _gen_tex((35,38,48,255),   (220,220,235,200), grid_size=5)
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  ORDER MANAGER
+# ══════════════════════════════════════════════════════════════════════════════
+class OrderManager:
+    def __init__(self, pts=150):
+        self.pending = 0
+        self.completed = 0
+        self.score = 0
+        self.pts = pts
+        self._spawn_t = 0.0
+        self._spawn_interval = 8.0
+
+    def spawn(self):
+        if self.pending < 5:
+            self.pending += 1
+            return True
+        return False
+
+    def complete(self):
+        if self.pending > 0:
+            self.pending -= 1
+        self.completed += 1
+        self.score += self.pts
+
+    def update(self, dt):
+        self._spawn_t += dt
+        if self._spawn_t >= self._spawn_interval:
+            self._spawn_t = 0.0
+            self.spawn()
+
+    def reset(self):
+        self.pending = self.completed = self.score = 0
+        self._spawn_t = 0.0
+
+orders = OrderManager()
+orders.spawn()
+
 # ── Temporizador ──────────────────────────────────────────────
 TIEMPO_LIMITE = 90
-tiempo_restante = TIEMPO_LIMITE
 juego_activo    = True
-pedidos_completados = 0
+tiempo_restante = TIEMPO_LIMITE
 
-# ──────────────────────────────────────────────────────────────
-#  PATHFINDING A* + DANGER MAP (prefiere rutas alejadas de paredes)
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  PATHFINDING A* + DANGER MAP
+# ══════════════════════════════════════════════════════════════════════════════
 GRID_RES  = 0.25
 GRID_COLS = int(size / GRID_RES)   # 20
 GRID_ROWS = int(size / GRID_RES)   # 20
 
-# Radio del bot: escala 0.5 → radio real 0.25, más margen mínimo
 BOT_RADIUS = 0.26
+WALL_MARGIN = 0.30
 
-WALL_MARGIN   = 0.30
-# Pared gris: scale_x=0.1 → half-extent=0.05. Con radio del bot + margen de seguridad:
-GRAY_X_MARGIN = 0.05 + BOT_RADIUS + 0.05   # ≈ 0.36
+# Pared gris: scale_x=0.1 → half=0.05. El bot (r=0.26) necesita 0.05+0.26=0.31 de clearance
+GRAY_HALF = 0.05
+GRAY_CLEARANCE = GRAY_HALF + BOT_RADIUS   # 0.31
 GRAY_Z_MIN, GRAY_Z_MAX = -2.5, 0.0
 
-# Parámetros del danger map
-DANGER_RADIUS = 3      # celdas de "zona de miedo" alrededor de obstáculos
-DANGER_MAX    = 4.0    # coste extra máximo (celda pegada a pared)
+DANGER_RADIUS = 3
+DANGER_MAX    = 4.0
 
 def _cell_center(row, col):
     return (-half + (col + 0.5) * GRID_RES,
             -half + (row + 0.5) * GRID_RES)
 
-def _build_grids(station_positions=None):
+def _build_grids(station_positions=None, station_scale=0.7):
     from collections import deque
 
     blocked = [[False]*GRID_COLS for _ in range(GRID_ROWS)]
     for r in range(GRID_ROWS):
         for c in range(GRID_COLS):
             wx, wz = _cell_center(r, c)
+            # Muros perimetrales
             if (wx < -half + WALL_MARGIN or wx > half - WALL_MARGIN or
                     wz < -half + WALL_MARGIN or wz > half - WALL_MARGIN):
                 blocked[r][c] = True
-            elif abs(wx) < GRAY_X_MARGIN and GRAY_Z_MIN <= wz <= GRAY_Z_MAX:
+            # Pared gris interna
+            elif abs(wx) < GRAY_CLEARANCE and GRAY_Z_MIN <= wz <= GRAY_Z_MAX:
                 blocked[r][c] = True
 
-    # Bloquear celdas ocupadas por estaciones (scale=0.7 → half=0.35)
+    # Estaciones como obstáculos
     if station_positions:
-        st_half = STATION_SCALE * 0.5 + BOT_RADIUS
+        st_half = station_scale * 0.5 + BOT_RADIUS
         for r in range(GRID_ROWS):
             for c in range(GRID_COLS):
                 wx, wz = _cell_center(r, c)
@@ -77,7 +116,7 @@ def _build_grids(station_positions=None):
                         blocked[r][c] = True
                         break
 
-    # BFS desde frontera de celdas bloqueadas → mapa de distancia
+    # Danger map
     dist   = [[999]*GRID_COLS for _ in range(GRID_ROWS)]
     danger = [[0.0]*GRID_COLS for _ in range(GRID_ROWS)]
     queue  = deque()
@@ -98,77 +137,105 @@ def _build_grids(station_positions=None):
         d = dist[r][c]
         if d >= DANGER_RADIUS:
             continue
-        for dr, dc in ((-1,0),(1,0),(0,-1),(0,1),
-                       (-1,-1),(-1,1),(1,-1),(1,1)):
+        for dr, dc in ((-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)):
             nr, nc = r+dr, c+dc
             if 0 <= nr < GRID_ROWS and 0 <= nc < GRID_COLS:
                 if not blocked[nr][nc] and dist[nr][nc] == 999:
                     dist[nr][nc] = d + 1
                     queue.append((nr, nc))
 
-    # Distancia → coste extra (cerca = caro)
     for r in range(GRID_ROWS):
         for c in range(GRID_COLS):
             d = dist[r][c]
             if d < DANGER_RADIUS:
-                t = d / DANGER_RADIUS          # 0 (pegado) → 1 (lejos)
+                t = d / DANGER_RADIUS
                 danger[r][c] = DANGER_MAX * (1.0 - t)
 
     return blocked, danger
 
-NAV_GRID, DANGER_GRID = None, None  # se calcula después de crear estaciones
+NAV_GRID, DANGER_GRID = None, None
 
 def world_to_cell(wx, wz):
     col = int((wx + half) / GRID_RES)
     row = int((wz + half) / GRID_RES)
-    return (max(0, min(GRID_ROWS-1, row)),
-            max(0, min(GRID_COLS-1, col)))
+    return (max(0, min(GRID_ROWS-1, row)), max(0, min(GRID_COLS-1, col)))
 
 def cell_to_world(row, col):
     return _cell_center(row, col)
 
-def nearest_free_cell(goal):
+def nearest_free_cell_connected(start, goal):
+    """BFS desde goal: retorna la celda libre más cercana al goal que sea alcanzable desde start."""
+    from collections import deque
     if not NAV_GRID[goal[0]][goal[1]]:
         return goal
+    # BFS desde start para marcar celdas alcanzables
+    visited = [[False]*GRID_COLS for _ in range(GRID_ROWS)]
+    queue = deque([start])
+    visited[start[0]][start[1]] = True
+    reachable = set()
+    while queue:
+        r, c = queue.popleft()
+        reachable.add((r, c))
+        for dr, dc in ((-1,0),(1,0),(0,-1),(0,1)):
+            nr, nc = r+dr, c+dc
+            if 0 <= nr < GRID_ROWS and 0 <= nc < GRID_COLS:
+                if not NAV_GRID[nr][nc] and not visited[nr][nc]:
+                    visited[nr][nc] = True
+                    queue.append((nr, nc))
+    # De las celdas alcanzables, encontrar la más cercana al goal
     best, best_d = None, 9999
-    for r in range(GRID_ROWS):
-        for c in range(GRID_COLS):
-            if not NAV_GRID[r][c]:
-                d = abs(r-goal[0]) + abs(c-goal[1])
-                if d < best_d:
-                    best_d, best = d, (r, c)
+    for r, c in reachable:
+        d = abs(r-goal[0]) + abs(c-goal[1])
+        if d < best_d:
+            best_d, best = d, (r, c)
     return best
 
 def heuristic(a, b):
     dr, dc = abs(a[0]-b[0]), abs(a[1]-b[1])
     return max(dr, dc) + (1.414-1)*min(dr, dc)
 
+def _smooth_path(path):
+    """Elimina waypoints redundantes (colineales) para suavizar la ruta."""
+    if len(path) < 3:
+        return path
+    smoothed = [path[0]]
+    for i in range(1, len(path)-1):
+        a = path[i-1]
+        b = path[i]
+        c = path[i+1]
+        # Vector AB × BC (cross product en 2D)
+        cross = (b.x - a.x)*(c.z - b.z) - (b.z - a.z)*(c.x - b.x)
+        if abs(cross) > 0.05:  # no colineal
+            smoothed.append(b)
+    smoothed.append(path[-1])
+    return smoothed
+
 def astar(start_world, goal_world, extra_blocked=None):
-    """A* con danger map: penaliza rutas cercanas a paredes y obstáculos.
-    extra_blocked: set de (row, col) con celdas temporalmente bloqueadas (otros bots)."""
     start = world_to_cell(start_world.x, start_world.z)
-    goal  = nearest_free_cell(world_to_cell(goal_world.x, goal_world.z))
+    goal_raw = world_to_cell(goal_world.x, goal_world.z)
+    goal = nearest_free_cell_connected(start, goal_raw)
     if goal is None:
         return []
     if start == goal:
         return [goal_world]
 
     open_heap = []
-    counter   = 0
+    counter = 0
     heapq.heappush(open_heap, (heuristic(start, goal), counter, start))
     came_from = {start: None}
-    g_score   = {start: 0.0}
+    g_score = {start: 0.0}
 
     while open_heap:
         _, _, current = heapq.heappop(open_heap)
         if current == goal:
-            path, node = [], goal
+            path = []
+            node = goal
             while node is not None:
                 wx, wz = cell_to_world(node[0], node[1])
                 path.append(Vec3(wx, goal_world.y, wz))
                 node = came_from[node]
             path.reverse()
-            return path
+            return _smooth_path(path)
 
         for dr in (-1, 0, 1):
             for dc in (-1, 0, 1):
@@ -182,53 +249,43 @@ def astar(start_world, goal_world, extra_blocked=None):
                 if extra_blocked and (nr, nc) in extra_blocked:
                     continue
                 if dr != 0 and dc != 0:
-                    if NAV_GRID[current[0]+dr][current[1]] or \
-                       NAV_GRID[current[0]][current[1]+dc]:
+                    if NAV_GRID[current[0]+dr][current[1]] or NAV_GRID[current[0]][current[1]+dc]:
                         continue
                 step = 1.414 if (dr != 0 and dc != 0) else 1.0
-                ng   = g_score[current] + step + DANGER_GRID[nr][nc]
+                ng = g_score[current] + step + DANGER_GRID[nr][nc]
                 neighbor = (nr, nc)
                 if ng < g_score.get(neighbor, 1e9):
-                    g_score[neighbor]   = ng
+                    g_score[neighbor] = ng
                     came_from[neighbor] = current
                     counter += 1
-                    heapq.heappush(open_heap,
-                        (ng + heuristic(neighbor, goal), counter, neighbor))
+                    heapq.heappush(open_heap, (ng + heuristic(neighbor, goal), counter, neighbor))
     return []
 
-
-# ──────────────────────────────────────────────────────────────
-#  COLISIONES: lista de obstáculos estáticos (cajas 1x1x1)
-# ──────────────────────────────────────────────────────────────
-static_obstacles = []   # lista de Vec3 (centro XZ de cada estación)
-all_bots = []           # lista de todas las instancias BotBase (se llena al crear cada bot)
+# ══════════════════════════════════════════════════════════════════════════════
+#  COLISIONES
+# ══════════════════════════════════════════════════════════════════════════════
+static_obstacles = []
+all_bots = []
 
 def register_obstacle(pos):
-    static_obstacles.append(Vec3(pos.x, pos.z, 0))  # guardamos x,z
+    static_obstacles.append(Vec3(pos.x, pos.z, 0))
 
-# ──────────────────────────────────────────────────────────────
-#  SEPARACIÓN ENTRE BOTS  (steering suave)
-# ──────────────────────────────────────────────────────────────
-BOT_SEP_RADIUS = 0.55    # distancia mínima entre centros de bots
-BOT_SEP_FORCE  = 6.0     # fuerza de empuje
+BOT_SEP_RADIUS = 0.55
+BOT_SEP_FORCE  = 6.0
 
 def apply_bot_separation(bot, dt):
-    """Empuja al bot para que no se solape con otros bots."""
     px, pz = bot.e.position.x, bot.e.position.z
     push_x, push_z = 0.0, 0.0
-
     for other in all_bots:
         if other is bot:
             continue
         ox, oz = other.e.position.x, other.e.position.z
         dx, dz = px - ox, pz - oz
-        dist = (dx * dx + dz * dz) ** 0.5
+        dist = (dx*dx + dz*dz)**0.5
         if dist < BOT_SEP_RADIUS and dist > 0.001:
-            # Fuerza inversamente proporcional a la distancia
             overlap = (BOT_SEP_RADIUS - dist) / BOT_SEP_RADIUS
             push_x += (dx / dist) * overlap * BOT_SEP_FORCE * dt
             push_z += (dz / dist) * overlap * BOT_SEP_FORCE * dt
-
     if push_x != 0.0 or push_z != 0.0:
         new_pos = Vec3(px + push_x, bot.e.position.y, pz + push_z)
         new_pos = push_out_of_obstacles(new_pos)
@@ -236,39 +293,33 @@ def apply_bot_separation(bot, dt):
         bot.e.position = new_pos
 
 def push_out_of_obstacles(bot_pos):
-    """Empuja la posición del bot para que no se solape con estaciones 1x1."""
     px, pz = bot_pos.x, bot_pos.z
     for obs in static_obstacles:
         ox, oz = obs.x, obs.y
-        # Caja AABB expandida con el radio del bot
         expand = 0.5 + BOT_RADIUS
         dx = px - ox
         dz = pz - oz
         if abs(dx) < expand and abs(dz) < expand:
             pen_x = expand - abs(dx)
             pen_z = expand - abs(dz)
-            # Empujar por el eje de MENOR penetración
             if pen_x <= pen_z:
                 px += pen_x * (1 if dx >= 0 else -1)
             else:
                 pz += pen_z * (1 if dz >= 0 else -1)
-    # Confinar dentro de los muros de ladrillo
     px = max(-half + WALL_MARGIN, min(half - WALL_MARGIN, px))
     pz = max(-half + WALL_MARGIN, min(half - WALL_MARGIN, pz))
     return Vec3(px, bot_pos.y, pz)
 
 def push_out_of_gray_wall(bot_pos):
-    """Evitar que el bot atraviese la pared gris interna."""
     px, pz = bot_pos.x, bot_pos.z
-    # Pared: x ∈ [-0.05, 0.05], z ∈ [-2.5, 0.0]
-    expand_x = 0.05 + BOT_RADIUS
+    expand_x = GRAY_HALF + BOT_RADIUS
     if abs(px) < expand_x and GRAY_Z_MIN - BOT_RADIUS < pz < GRAY_Z_MAX + BOT_RADIUS:
         px = expand_x * (1 if px >= 0 else -1)
     return Vec3(px, bot_pos.y, pz)
 
-# ──────────────────────────────────────────────────────────────
-#  PAREDES / PISO
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  ESCENA
+# ══════════════════════════════════════════════════════════════════════════════
 faces_data = [
     {'pos': (0, 0,  half), 'rot': (0, 180, 0), 'eje': 'z', 'dir':  1, 'tex': wall_tex},
     {'pos': (0, 0, -half), 'rot': (0, 0,   0), 'eje': 'z', 'dir': -1, 'tex': wall_tex},
@@ -279,16 +330,12 @@ faces_data = [
 
 walls = []
 for face in faces_data:
-    w = Entity(model='quad', scale=(size, size),
-               position=face['pos'], rotation=face['rot'],
-               texture=face['tex'], double_sided=True)
+    w = Entity(model='quad', scale=(size, size), position=face['pos'],
+               rotation=face['rot'], texture=face['tex'], double_sided=True)
     w.texture_scale = (size, size)
     w.eje, w.dir = face['eje'], face['dir']
     walls.append(w)
 
-# ──────────────────────────────────────────────────────────────
-#  HELPER: CUBO ESTILO DIBUJO
-# ──────────────────────────────────────────────────────────────
 STATION_SCALE = 0.7
 STATION_Y = -half + STATION_SCALE * 0.5
 
@@ -298,9 +345,6 @@ def Station(pos, col):
     register_obstacle(pos)
     return e
 
-# ──────────────────────────────────────────────────────────────
-#  ESTACIONES (posiciones fijas, más pequeñas, tocando el suelo)
-# ──────────────────────────────────────────────────────────────
 pos_tomate     = Vec3( 1, STATION_Y, -2)
 pos_lechuga    = Vec3( 2, STATION_Y, -2)
 pos_corte      = Vec3(-2, STATION_Y, -2)
@@ -315,13 +359,10 @@ st_ensamblaje = Station(pos_ensamblaje, color.brown)
 st_platos     = Station(pos_platos,     color.white)
 st_entrega    = Station(pos_entrega,    color.azure)
 
-# Construir navgrid AHORA que las estaciones existen
 station_positions = [pos_tomate, pos_lechuga, pos_corte, pos_ensamblaje, pos_platos, pos_entrega]
 NAV_GRID, DANGER_GRID = _build_grids(station_positions)
 
-# ── Posiciones de ACCESO (frente a cada estación, lado interior) ──
-# Los bots navegan hasta aquí en lugar de al centro de la caja.
-_BOT_Y = -half + 0.25   # base del bot toca el suelo (scale=0.5)
+_BOT_Y = -half + 0.25
 acc_tomate     = Vec3( 1.0, _BOT_Y, -1.3)
 acc_lechuga    = Vec3( 2.0, _BOT_Y, -1.3)
 acc_corte      = Vec3(-1.3, _BOT_Y, -2.0)
@@ -329,27 +370,22 @@ acc_ensamblaje = Vec3(-1.3, _BOT_Y, -1.0)
 acc_platos     = Vec3(-1.3, _BOT_Y,  0.0)
 acc_entrega    = Vec3( 1.3, _BOT_Y,  1.0)
 
-# ── Posiciones de espera idle – fuera de las rutas de B1/B2 ──
 pos_idle_b2 = Vec3( 0.0, _BOT_Y,  2.0)
 pos_idle_b3 = Vec3( 1.5, _BOT_Y,  1.5)
 pos_idle_b4 = Vec3( 2.0, _BOT_Y,  0.5)
 
-# Pared interna gris (obstáculo)
 gray_wall = Entity(model='cube', color=color.gray,
                    position=(0, -half + 2.5, -1.25),
                    scale=(0.1, 5, 2.5), unlit=True)
 
-# ──────────────────────────────────────────────────────────────
-#  INGREDIENTE VISUAL
-# ──────────────────────────────────────────────────────────────
 def crear_ingrediente(pos, col, nombre):
     e = Entity(model='sphere', color=col, position=pos, scale=0.35, unlit=True)
     e.nombre = nombre
     return e
 
-# ──────────────────────────────────────────────────────────────
-#  ESTADOS DE CADA BOT
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  ESTADOS
+# ══════════════════════════════════════════════════════════════════════════════
 class EstadoBot1(Enum):
     IR_TOMATE   = auto()
     IR_CORTE_T  = auto()
@@ -375,44 +411,40 @@ class EstadoBot4(Enum):
     IR_PLATO   = auto()
     IR_ENTREGA = auto()
 
-# ──────────────────────────────────────────────────────────────
-#  COLAS COMPARTIDAS
-# ──────────────────────────────────────────────────────────────
 cola_corte      = []
 cola_ensamblaje = []
 cola_platos     = []
 plato_actual    = []
 
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 #  CLASE BASE CON PATHFINDING
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 class BotBase:
-    SPEED     = 3.0
-    REACH     = 0.35   # distancia para considerar "llegó al waypoint"
+    SPEED = 3.0
+    REACH = 0.35
 
     def __init__(self):
-        self.waypoints = []   # lista de Vec3 generada por A*
+        self.waypoints = []
         self._destino_final = None
         self._last_pos = None
         self._stuck_t = 0.0
+        self._idle_pos = None
         all_bots.append(self)
 
     def _blocked_by_bots(self):
-        """Retorna set de celdas ocupadas por otros bots."""
         blocked = set()
         for bot in all_bots:
             if bot is self:
                 continue
             r, c = world_to_cell(bot.e.position.x, bot.e.position.z)
-            for dr in (-1, 0, 1):
-                for dc in (-1, 0, 1):
+            for dr in (-2, -1, 0, 1, 2):
+                for dc in (-2, -1, 0, 1, 2):
                     nr, nc = r + dr, c + dc
                     if 0 <= nr < GRID_ROWS and 0 <= nc < GRID_COLS:
                         blocked.add((nr, nc))
         return blocked
 
     def set_destino(self, target: Vec3, force=False):
-        """Calcula ruta A* hacia target, evitando otros bots."""
         if not force and target == self._destino_final:
             return
         self._destino_final = target
@@ -421,10 +453,17 @@ class BotBase:
         if path:
             self.waypoints = path
         else:
-            self.waypoints = [target]
+            # Fallback: ir a idle point más cercano
+            if self._idle_pos:
+                path_idle = astar(self.e.position, self._idle_pos, extra_blocked=blocked)
+                if path_idle:
+                    self.waypoints = path_idle
+                else:
+                    self.waypoints = []
+            else:
+                self.waypoints = []
 
     def mover(self, dt):
-        """Avanza por los waypoints. Devuelve True si aún está en movimiento."""
         if not self.waypoints:
             return False
 
@@ -433,17 +472,17 @@ class BotBase:
         dir_vec.y = 0
         dist = dir_vec.length()
 
+        # Rotar hacia el waypoint
+        if dist > 0.01:
+            angle = math.degrees(math.atan2(dir_vec.x, dir_vec.z))
+            self.e.rotation_y = lerp(self.e.rotation_y, angle, 10 * dt)
+
         if dist > self.REACH:
             move = dir_vec.normalized() * self.SPEED * dt
             new_pos = self.e.position + move
-
-            # Colisiones con obstáculos y paredes
             new_pos = push_out_of_obstacles(new_pos)
             new_pos = push_out_of_gray_wall(new_pos)
-
             self.e.position = new_pos
-
-            # Separación con otros bots
             apply_bot_separation(self, dt)
 
             # Detectar atasco
@@ -456,12 +495,10 @@ class BotBase:
                 self._stuck_t = 0.0
                 self._last_pos = self.e.position
 
-            # Recalcular si está atascado > 0.4s
-            if self._stuck_t > 0.4 and self._destino_final:
+            if self._stuck_t > 0.5 and self._destino_final:
                 self._stuck_t = 0.0
                 self.set_destino(self._destino_final, force=True)
 
-            # Llevar la carga encima
             if hasattr(self, 'carga') and self.carga:
                 self.carga.position = self.e.position + Vec3(0, 0.5, 0)
             if hasattr(self, 'cargas'):
@@ -469,12 +506,12 @@ class BotBase:
                     c.position = self.e.position + Vec3((idx - 0.5) * 0.3, 0.6, 0)
             return True
         else:
-            # Waypoint alcanzado
             self.waypoints.pop(0)
             self._stuck_t = 0.0
             if not self.waypoints:
                 dest = self._destino_final
-                self.e.position = Vec3(dest.x, self.e.position.y, dest.z)
+                if dest:
+                    self.e.position = Vec3(dest.x, self.e.position.y, dest.z)
                 if hasattr(self, 'carga') and self.carga:
                     self.carga.position = self.e.position + Vec3(0, 0.5, 0)
                 apply_bot_separation(self, dt)
@@ -485,9 +522,12 @@ class BotBase:
     def llegó(self):
         return not self.waypoints and self._destino_final is not None
 
-# ──────────────────────────────────────────────────────────────
+    def get_status(self):
+        return "idle"
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  BOT 1 – Recolector
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 class Bot1(BotBase):
     SPEED = 3.5
 
@@ -502,18 +542,21 @@ class Bot1(BotBase):
         self.estado = EstadoBot1.IR_TOMATE
         self.carga  = None
         self.timer  = 0.0
+        self._idle_pos = pos_idle_b2
         self.set_destino(acc_tomate)
+
+    def get_status(self):
+        if self.carga:
+            return f"cargando {self.carga.nombre}"
+        return "recolectando"
 
     def update(self, dt):
         if not juego_activo:
             return
-
         en_movimiento = self.mover(dt)
-
         if en_movimiento:
             return
 
-        # ── Acciones al llegar ────────────────────────────────
         if self.estado == EstadoBot1.IR_TOMATE:
             self.timer += dt
             if self.timer >= 0.5:
@@ -550,10 +593,9 @@ class Bot1(BotBase):
             self._destino_final = None
             self.set_destino(acc_tomate)
 
-
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 #  BOT 2 – Cortador
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 class Bot2(BotBase):
     SPEED    = 3.0
     T_CORTAR = 1.2
@@ -569,6 +611,14 @@ class Bot2(BotBase):
         self.estado = EstadoBot2.ESPERAR
         self.carga  = None
         self.timer  = 0.0
+        self._idle_pos = pos_idle_b2
+
+    def get_status(self):
+        if self.estado == EstadoBot2.CORTAR:
+            return "cortando"
+        if self.carga:
+            return f"lleva {self.carga.nombre}"
+        return "esperando"
 
     def update(self, dt):
         if not juego_activo:
@@ -632,10 +682,9 @@ class Bot2(BotBase):
             self.carga  = None
             self.estado = EstadoBot2.ESPERAR
 
-
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 #  BOT 3 – Ensamblador
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 class Bot3(BotBase):
     SPEED = 2.8
 
@@ -649,6 +698,12 @@ class Bot3(BotBase):
                           billboard=True, color=color.white)
         self.estado = EstadoBot3.ESPERAR
         self.carga  = None
+        self._idle_pos = pos_idle_b3
+
+    def get_status(self):
+        if self.carga:
+            return f"lleva {self.carga.nombre}"
+        return "esperando"
 
     def update(self, dt):
         if not juego_activo:
@@ -702,10 +757,9 @@ class Bot3(BotBase):
                 plato_actual.clear()
             self.estado = EstadoBot3.ESPERAR
 
-
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 #  BOT 4 – Repartidor
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 class Bot4(BotBase):
     SPEED = 3.2
 
@@ -719,9 +773,15 @@ class Bot4(BotBase):
                           billboard=True, color=color.white)
         self.estado = EstadoBot4.ESPERAR
         self.cargas = []
+        self._idle_pos = pos_idle_b4
+
+    def get_status(self):
+        if self.cargas:
+            return f"reparte {len(self.cargas)} items"
+        return "esperando"
 
     def update(self, dt):
-        global pedidos_completados
+        global juego_activo
         if not juego_activo:
             return
 
@@ -752,11 +812,8 @@ class Bot4(BotBase):
             return
 
         en_movimiento = self.mover(dt)
-
-        # Actualizar posición de las cargas durante movimiento
         for idx, c in enumerate(self.cargas):
             c.position = self.e.position + Vec3((idx - 0.5) * 0.3, 0.6, 0)
-
         if en_movimiento:
             return
 
@@ -787,31 +844,29 @@ class Bot4(BotBase):
             for c in self.cargas:
                 destroy(c)
             self.cargas = []
-            pedidos_completados += 1
-            actualizar_contador()
+            orders.complete()
             st_entrega.animate_scale(1.4, duration=0.15)
             st_entrega.animate_scale(1.0, duration=0.15, delay=0.15)
             self.estado = EstadoBot4.ESPERAR
 
-
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 #  INSTANCIAR BOTS
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 bot1 = Bot1()
 bot2 = Bot2()
 bot3 = Bot3()
 bot4 = Bot4()
 
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 #  UI
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 window.color = color.dark_gray
 window.fps_counter.enabled = False
 window.exit_button.visible = False
 
-Text(text="CONTROLES: WASD / Flechas",
-     position=(-0.75, 0.45), origin=(-0.5, 0.5),
-     scale=1.1, background=True)
+Text(text="CONTROLES: WASD / Flechas | R: Reiniciar",
+     position=(-0.75, 0.48), origin=(-0.5, 0.5),
+     scale=1.0, background=True)
 
 leyenda_texto = (
     "<red>Rojo:<default> Tomate\n"
@@ -820,22 +875,25 @@ leyenda_texto = (
     "<brown>Cafe:<default> Ensamblaje\n"
     "Blanco: Platos\n"
     "<azure>Azul:<default> Entrega\n"
-    "Gris: Pared\n\n"
-    "<orange>■<default> Bot1: Recolector\n"
-    "<magenta>■<default> Bot2: Cortador\n"
-    "<cyan>■<default> Bot3: Ensamblador\n"
-    "<violet>■<default> Bot4: Repartidor"
+    "Gris: Pared"
 )
-Text(text=leyenda_texto, position=(0.55, 0.45),
-     origin=(-0.5, 0.5), scale=0.85, background=True)
+Text(text=leyenda_texto, position=(0.55, 0.48),
+     origin=(-0.5, 0.5), scale=0.8, background=True)
 
-timer_text = Text(text="⏱ 1:30", position=(0, 0.46),
-                  origin=(0, 0.5), scale=1.8,
+# HUD de estado por bot
+bot_hud = []
+for i in range(4):
+    t = Text(text=f"B{i+1}: ...", position=(-0.75, 0.40 - i*0.05),
+             origin=(-0.5, 0.5), scale=0.75, color=color.white)
+    bot_hud.append(t)
+
+timer_text = Text(text="1:30", position=(0, 0.48),
+                  origin=(0, 0.5), scale=1.6,
                   background=True, color=color.yellow)
 
-counter_text = Text(text="🍽 Pedidos: 0", position=(0, 0.36),
-                    origin=(0, 0.5), scale=1.5,
-                    background=True, color=color.lime)
+score_text = Text(text="Score: 0 | Pedidos: 0/0", position=(0, 0.42),
+                  origin=(0, 0.5), scale=1.2,
+                  background=True, color=color.lime)
 
 fin_bg = Entity(model='quad', color=color.black66,
                 scale=(0.9, 0.35), position=(0, 0),
@@ -844,42 +902,43 @@ fin_text = Text(text="", position=(0, 0), origin=(0, 0),
                 scale=2.5, color=color.white, parent=camera.ui,
                 enabled=False, z=-2)
 
-def actualizar_contador():
-    counter_text.text = f"🍽 Pedidos: {pedidos_completados}"
-
 def mostrar_fin():
+    global juego_activo
+    juego_activo = False
     fin_bg.enabled   = True
     fin_text.enabled = True
-    fin_text.text    = (f"⏰ ¡TIEMPO!\n"
-                        f"Pedidos completados: {pedidos_completados}")
+    fin_text.text    = (f"TIEMPO!\n"
+                        f"Pedidos: {orders.completed}\n"
+                        f"Score: {orders.score}")
     fin_text.color   = color.yellow
 
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 #  CÁMARA ORBITAL
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 pivot = Entity()
 camera.parent   = pivot
 camera.position = (0, 0, -18)
 pivot.rotation_x, pivot.rotation_y = 35, 45
 
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 #  UPDATE PRINCIPAL
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 def update():
     global tiempo_restante, juego_activo
 
     dt = time.dt
 
+    # Timer + ordenes
     if juego_activo:
         tiempo_restante -= dt
+        orders.update(dt)
         if tiempo_restante <= 0:
             tiempo_restante = 0
-            juego_activo    = False
             mostrar_fin()
 
         mins = int(tiempo_restante) // 60
         segs = int(tiempo_restante) % 60
-        timer_text.text = f"⏱ {mins}:{segs:02d}"
+        timer_text.text = f"{mins}:{segs:02d}"
 
         if tiempo_restante < 20:
             timer_text.color = color.red
@@ -888,11 +947,37 @@ def update():
         else:
             timer_text.color = color.yellow
 
+        score_text.text = f"Score: {orders.score} | Pedidos: {orders.completed}/{orders.pending}"
+
+    # Input
+    if held_keys['r']:
+        tiempo_restante = TIEMPO_LIMITE
+        juego_activo = True
+        orders.reset()
+        orders.spawn()
+        cola_corte.clear()
+        cola_ensamblaje.clear()
+        cola_platos.clear()
+        plato_actual.clear()
+        bot1.__init__()
+        bot2.__init__()
+        bot3.__init__()
+        bot4.__init__()
+        fin_bg.enabled = False
+        fin_text.enabled = False
+
+    # Bots
     bot1.update(dt)
     bot2.update(dt)
     bot3.update(dt)
     bot4.update(dt)
 
+    # HUD estado
+    for i, bot in enumerate([bot1, bot2, bot3, bot4]):
+        status = bot.get_status()
+        bot_hud[i].text = f"B{i+1}: {status}"
+
+    # Cámara
     rot_speed = 100 * dt
     pivot.rotation_y += (held_keys['d'] - held_keys['a'] +
                          held_keys['right arrow'] - held_keys['left arrow']) * rot_speed
