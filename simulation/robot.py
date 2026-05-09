@@ -1,16 +1,22 @@
 """
-simulation/robot.py — Robot genérico con rol asignado.
-4 roles: recolector, cortador, ensamblador, repartidor.
+simulation/robot.py — Robot con estilo unlit + edge_color (estilo dibujo).
 """
 
 from ursina import Entity, Vec3, color
 from .physics import PhysicsWorld
 
 ROLE_CONFIG = {
-    "recolector":   {"max_speed": 10.0, "force": 25.0, "color": [0.20, 0.50, 1.0]},
-    "cortador":     {"max_speed":  7.0, "force": 18.0, "color": [1.0,  0.25, 0.25]},
-    "ensamblador":  {"max_speed":  7.0, "force": 18.0, "color": [0.20, 0.85, 0.25]},
-    "repartidor":   {"max_speed": 10.0, "force": 25.0, "color": [1.0,  0.85, 0.15]},
+    "recolector":   {"max_speed": 10.0, "force": 25.0},
+    "cortador":     {"max_speed":  7.0, "force": 18.0},
+    "ensamblador":  {"max_speed":  7.0, "force": 18.0},
+    "repartidor":   {"max_speed": 10.0, "force": 25.0},
+}
+
+ROLE_COLORS = {
+    "recolector":   color.rgb(50, 120, 240),
+    "cortador":     color.rgb(240, 60, 60),
+    "ensamblador":  color.rgb(50, 210, 60),
+    "repartidor":   color.rgb(240, 210, 30),
 }
 
 
@@ -29,7 +35,6 @@ class Robot:
         self.start_cell = start_cell
         self.start_pos = world_pos
         self.config = ROLE_CONFIG[role]
-
         self.current_cell = start_cell
         self.carrying = None
         self.action = "idle"
@@ -43,13 +48,18 @@ class Robot:
             angular_damping=0.9)
 
         self.visual = Entity(
-            model="cube", color=color.rgb(*self.config["color"]),
-            scale=self.URSINA_SCALE, position=Vec3(x, y + 0.5, z))
+            model="cube", color=ROLE_COLORS[role],
+            scale=self.URSINA_SCALE, position=Vec3(x, y + 0.5, z),
+            unlit=True, edge_color=color.black, edge_width=3,
+        )
 
-        self.label = Entity(
-            parent=self.visual,
-            model="quad", color=color.white,
-            scale=(0.6, 0.6, 1), position=Vec3(0, 1.5, 0), billboard=True)
+        self.plate = Entity(
+            parent=self.visual, model="cube",
+            color=color.rgb(255, 220, 80),
+            scale=(0.7, 0.15, 0.7), position=Vec3(0, 1.2, 0),
+            unlit=True, edge_color=color.black, edge_width=2,
+            enabled=False,
+        )
 
     def sync_visual(self):
         pos = self.physics.get_position(self.body_id)
@@ -76,26 +86,27 @@ class Robot:
         self.carrying = ingredient
         ingredient.pickup(self)
         self.action = "carrying"
+        self.plate.enabled = True
 
     def drop_at(self, world_pos):
         if self.carrying:
             self.carrying.drop(world_pos)
             self.carrying = None
         self.action = "idle"
+        self.plate.enabled = False
 
     def _stop(self):
-        lin = self.physics.get_velocity(self.body_id)
         self.physics.reset_body(self.body_id, self.get_position())
 
     def _clamp_speed(self):
+        import pybullet as p
         lin = self.physics.get_velocity(self.body_id)
         speed = (lin[0]**2 + lin[2]**2) ** 0.5
         if speed > self.config["max_speed"]:
             factor = self.config["max_speed"] / speed
-            import pybullet as p
             p.resetBaseVelocity(self.body_id,
                 linearVelocity=(lin[0]*factor, lin[1], lin[2]*factor),
-                angularVelocity=(0,0,0),
+                angularVelocity=(0, 0, 0),
                 physicsClientId=self.physics.client)
 
     def reset(self, world_pos=None):
@@ -104,5 +115,6 @@ class Robot:
         self.action = "idle"
         self.current_cell = self.start_cell
         self.stuck_timer = 0.0
+        self.plate.enabled = False
         self.physics.reset_body(self.body_id, (target[0], target[1] + 0.5, target[2]))
         self.visual.position = Vec3(target[0], target[1] + 0.5, target[2])

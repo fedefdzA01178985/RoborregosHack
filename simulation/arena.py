@@ -1,11 +1,25 @@
 """
-simulation/arena.py — Carga map_config.json y construye el grid 3D 5x5.
-Cada celda = cubo de 5x5x5m. Paredes visibles. Lineas de grid. Perimetro.
+simulation/arena.py — Arena 3D con texturas PIL, paredes quads, estilo unlit.
+Grid 5x5 de 5x5x5m. Paredes con textura de rejilla. Suelo con grid.
+Los objetos de estacion usan unlit + edge_color (estilo dibujo).
 """
 
 import json
-from ursina import Entity, Vec3, color, Text
+from ursina import Entity, Vec3, color, Texture
+from PIL import Image, ImageDraw
 from .physics import PhysicsWorld
+
+
+def generate_grid_tex(bg_rgba, line_rgba, grid_size=5, res=1024):
+    img = Image.new("RGBA", (res, res), bg_rgba)
+    draw = ImageDraw.Draw(img)
+    lw = 6
+    for i in range(grid_size + 1):
+        pos = int((i / grid_size) * (res - lw / 2))
+        draw.line((0, pos, res, pos), fill=line_rgba, width=lw)
+        draw.line((pos, 0, pos, res), fill=line_rgba, width=lw)
+    return Texture(img)
+
 
 CELL_FLOOR_COLORS = {
     "almacen":    color.rgb(40, 140, 40),
@@ -17,12 +31,12 @@ CELL_FLOOR_COLORS = {
     "pasillo":    color.rgb(45, 50, 60),
 }
 
-STATION_TEXT_COLORS = {
-    "almacen":    color.rgb(150, 255, 150),
-    "tablero":    color.rgb(180, 180, 255),
-    "corte":      color.rgb(220, 220, 220),
-    "ensamblaje": color.rgb(255, 230, 120),
-    "entrega":    color.rgb(120, 255, 120),
+STATION_COLORS = {
+    "almacen":    color.rgb(60, 180, 60),
+    "tablero":    color.rgb(80, 80, 180),
+    "corte":      color.rgb(180, 180, 190),
+    "ensamblaje": color.rgb(240, 180, 40),
+    "entrega":    color.rgb(40, 160, 40),
 }
 
 
@@ -39,18 +53,24 @@ class Arena:
         self.wall_height = self.config["wall_height"]
         self.cw, self.ch, self.cd = self.cell_size
 
+        self.arena_w = self.cols * self.cw
+        self.arena_d = self.rows * self.cd
+        self.hw = self.arena_w / 2
+        self.hd = self.arena_d / 2
+        self.wh = self.wall_height
+
         self.cell_data = {}
         for c in self.config["cells"]:
             self.cell_data[(c["row"], c["col"])] = c
 
-        self._build_ground_plane()
+        self._build_textures()
+        self._build_floor()
+        self._build_wall_quads()
         self._build_cell_floors()
-        self._build_grid_lines()
-        self._build_perimeter_walls()
-        self._build_internal_walls()
-        self._build_station_labels()
+        self._build_stations()
+        self._build_perimeter_physics()
 
-        print(f"[Arena] Grid {self.rows}x{self.cols} | cells={len(self.cell_data)}")
+        print(f"[Arena] Grid {self.rows}x{self.cols} | {self.arena_w}x{self.arena_d}m | cells={len(self.cell_data)}")
 
     def cell_center(self, row, col):
         cx = (col - (self.cols - 1) / 2) * self.cw
@@ -61,12 +81,6 @@ class Arena:
         cx = (col - (self.cols - 1) / 2) * self.cw
         cz = (row - (self.rows - 1) / 2) * self.cd
         return (cx, 0.5, cz)
-
-    def arena_half_w(self):
-        return self.cols * self.cw / 2
-
-    def arena_half_d(self):
-        return self.rows * self.cd / 2
 
     def is_passable(self, row, col):
         if not (0 <= row < self.rows and 0 <= col < self.cols):
@@ -95,14 +109,46 @@ class Arena:
         return [(c["row"], c["col"]) for c in self.config["cells"]
                 if c.get("type") == station_type]
 
-    def _build_ground_plane(self):
-        hw = self.arena_half_w() + 2
-        hd = self.arena_half_d() + 2
+    # ── Texturas ───────────────────────────────────────────────────────
+
+    def _build_textures(self):
+        bg_floor = (35, 38, 48, 255)
+        ln_grid = (220, 220, 235, 200)
+        self.floor_tex = generate_grid_tex(bg_floor, ln_grid, grid_size=self.rows)
+
+        bg_wall = (130, 155, 185, 255)
+        ln_wall = (210, 220, 235, 200)
+        self.wall_tex = generate_grid_tex(bg_wall, ln_wall, grid_size=self.rows)
+
+    # ── Suelo ──────────────────────────────────────────────────────────
+
+    def _build_floor(self):
         Entity(
-            model="cube", color=color.rgb(12, 14, 20),
-            scale=(hw * 2, 0.1, hd * 2),
-            position=Vec3(0, -0.1, 0),
+            model="quad", scale=(self.arena_w, self.arena_d),
+            position=(0, 0, 0), rotation=(-90, 0, 0),
+            texture=self.floor_tex, double_sided=True,
         )
+
+    # ── Paredes visuales (quads) ────────────────────────────────────────
+
+    def _build_wall_quads(self):
+        faces = [
+            {"pos": (0, self.wh / 2, self.hd),  "rot": (0, 180, 0),  "eje": "z", "dir": 1},
+            {"pos": (0, self.wh / 2, -self.hd), "rot": (0, 0, 0),    "eje": "z", "dir": -1},
+            {"pos": (self.hw, self.wh / 2, 0),  "rot": (0, 90, 0),   "eje": "x", "dir": 1},
+            {"pos": (-self.hw, self.wh / 2, 0), "rot": (0, -90, 0),  "eje": "x", "dir": -1},
+        ]
+        self.wall_quads = []
+        for f in faces:
+            w = Entity(
+                model="quad", scale=(self.arena_w, self.wh),
+                position=f["pos"], rotation=f["rot"],
+                texture=self.wall_tex, double_sided=True,
+            )
+            w.eje, w.dir = f["eje"], f["dir"]
+            self.wall_quads.append(w)
+
+    # ── Pisos de celdas ────────────────────────────────────────────────
 
     def _build_cell_floors(self):
         for row in range(self.rows):
@@ -113,33 +159,45 @@ class Arena:
                 clr = CELL_FLOOR_COLORS.get(tp, CELL_FLOOR_COLORS["pasillo"])
                 Entity(
                     model="cube", color=clr,
-                    scale=(self.cw * 0.96, 0.06, self.cd * 0.96),
-                    position=Vec3(cx, 0.02, cz),
+                    scale=(self.cw * 0.94, 0.04, self.cd * 0.94),
+                    position=Vec3(cx, 0.01, cz),
+                    unlit=True, edge_color=color.black, edge_width=1,
                 )
 
-    def _build_grid_lines(self):
-        line_color = color.rgb(200, 200, 220)
-        hw = self.arena_half_w()
-        hd = self.arena_half_d()
-        thin = 0.04
-        for row in range(self.rows + 1):
-            z = hd - row * self.cd
-            Entity(model="cube", color=line_color,
-                   scale=(hw * 2, 0.03, thin),
-                   position=Vec3(0, 0.05, z))
-        for col in range(self.cols + 1):
-            x = -hw + col * self.cw
-            Entity(model="cube", color=line_color,
-                   scale=(thin, 0.03, hd * 2),
-                   position=Vec3(x, 0.05, 0))
+    # ── Estaciones (cubos unlit con borde) ──────────────────────────────
 
-    def _build_perimeter_walls(self):
+    def _build_stations(self):
+        for cell in self.config["cells"]:
+            row, col = cell["row"], cell["col"]
+            tp = cell["type"]
+            if tp == "obstacle":
+                self._build_obstacle_cube(row, col)
+                continue
+            cx, _, cz = self.cell_center_3d(row, col)
+            st_color = STATION_COLORS.get(tp, color.white)
+            Entity(
+                model="cube", color=st_color,
+                position=Vec3(cx, 0.6, cz), scale=1.2,
+                unlit=True, edge_color=color.black, edge_width=3,
+            )
+
+    def _build_obstacle_cube(self, row, col):
+        cx, _, cz = self.cell_center_3d(row, col)
+        Entity(
+            model="cube", color=color.rgb(190, 50, 50),
+            position=Vec3(cx, self.wall_height / 2, cz),
+            scale=(self.cw * 0.85, self.wall_height, self.cd * 0.85),
+            unlit=True, edge_color=color.black, edge_width=2,
+        )
+
+    # ── Fi­sica (PyBullet) ──────────────────────────────────────────────
+
+    def _build_perimeter_physics(self):
         wt = 0.3
         wh = self.wall_height
         hw = wh / 2
-        ahw = self.arena_half_w()
-        ahd = self.arena_half_d()
-        wall_color = color.rgb(70, 75, 90)
+        ahw = self.hw
+        ahd = self.hd
         segments = [
             (ahw + wt/2, hw, 0, wt/2, wh/2, ahd + wt),
             (-(ahw + wt/2), hw, 0, wt/2, wh/2, ahd + wt),
@@ -150,85 +208,15 @@ class Arena:
             self.physics.create_box(
                 half_extents=(hx, hy, hz), mass=0,
                 position=(wx, wy, wz), friction=0.3)
-            Entity(model="cube", color=wall_color,
-                   scale=(hx * 2, hy * 2, hz * 2),
-                   position=Vec3(wx, wy, wz))
 
-    def _build_internal_walls(self):
-        wt = 0.2
-        wh = self.wall_height
-        hw = wh / 2
-        wall_color = color.rgb(100, 105, 120)
-
-        for row in range(self.rows):
-            for col in range(self.cols):
-                cx, _, cz = self.cell_center_3d(row, col)
-                cell = self.cell_data.get((row, col))
-
-                if cell and cell.get("type") == "obstacle":
-                    self.physics.create_box(
-                        half_extents=(self.cw/2, wh/2, wt/2), mass=0,
-                        position=(cx, hw, cz - self.cd/2))
-                    self.physics.create_box(
-                        half_extents=(self.cw/2, wh/2, wt/2), mass=0,
-                        position=(cx, hw, cz + self.cd/2))
-                    self.physics.create_box(
-                        half_extents=(wt/2, wh/2, self.cd/2), mass=0,
-                        position=(cx - self.cw/2, hw, cz))
-                    self.physics.create_box(
-                        half_extents=(wt/2, wh/2, self.cd/2), mass=0,
-                        position=(cx + self.cw/2, hw, cz))
-                    Entity(model="cube", color=color.rgb(180, 40, 40),
-                           scale=(self.cw, wh, wt),
-                           position=Vec3(cx, hw, cz - self.cd/2))
-                    Entity(model="cube", color=color.rgb(180, 40, 40),
-                           scale=(self.cw, wh, wt),
-                           position=Vec3(cx, hw, cz + self.cd/2))
-                    Entity(model="cube", color=color.rgb(180, 40, 40),
-                           scale=(wt, wh, self.cd),
-                           position=Vec3(cx - self.cw/2, hw, cz))
-                    Entity(model="cube", color=color.rgb(180, 40, 40),
-                           scale=(wt, wh, self.cd),
-                           position=Vec3(cx + self.cw/2, hw, cz))
-                    continue
-
-                if col < self.cols - 1 and self._needs_wall(cell, row, col + 1):
-                    wx = cx + self.cw / 2
-                    self.physics.create_box(
-                        half_extents=(wt/2, wh/2, self.cd/2), mass=0,
-                        position=(wx, hw, cz))
-                    Entity(model="cube", color=wall_color,
-                           scale=(wt, wh, self.cd),
-                           position=Vec3(wx, hw, cz))
-
-                if row < self.rows - 1 and self._needs_wall(cell, row + 1, col):
-                    wz = cz + self.cd / 2
-                    self.physics.create_box(
-                        half_extents=(self.cw/2, wh/2, wt/2), mass=0,
-                        position=(cx, hw, wz))
-                    Entity(model="cube", color=wall_color,
-                           scale=(self.cw, wh, wt),
-                           position=Vec3(cx, hw, wz))
-
-    def _needs_wall(self, cell_a, row_b, col_b):
-        type_a = cell_a.get("type") if cell_a else "pasillo"
-        cell_b = self.cell_data.get((row_b, col_b))
-        type_b = cell_b.get("type") if cell_b else "pasillo"
-        if type_a == "obstacle" or type_b == "obstacle":
-            return True
-        return False
-
-    def _build_station_labels(self):
-        for cell in self.config["cells"]:
-            row, col = cell["row"], cell["col"]
-            tp = cell["type"]
-            if tp == "obstacle":
+        for (row, col), cell in self.cell_data.items():
+            if cell.get("type") != "obstacle":
                 continue
             cx, _, cz = self.cell_center_3d(row, col)
-            label = cell.get("label", tp).upper()
-            txt_color = STATION_TEXT_COLORS.get(tp, color.white)
-            Entity(model="quad", color=color.rgba(0, 0, 0, 200),
-                   scale=(2.5, 0.7, 1),
-                   position=Vec3(cx, 3.6, cz), billboard=True)
-            Text(text=label, position=Vec3(cx, 3.6, cz),
-                 origin=(0, 0), scale=1.2, color=txt_color, billboard=True)
+            for bx, bz in [(0, -self.cd/2), (0, self.cd/2),
+                           (-self.cw/2, 0), (self.cw/2, 0)]:
+                hx = self.cw/2 if bx == 0 else wt/2
+                hz = self.cd/2 if bz == 0 else wt/2
+                self.physics.create_box(
+                    half_extents=(hx, wh/2, hz), mass=0,
+                    position=(cx + bx, wh/2, cz + bz), friction=0.3)

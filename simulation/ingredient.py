@@ -1,29 +1,18 @@
 """
-simulation/ingredient.py — Ingrediente con f�sica PyBullet y visual Ursina.
-Estados: crudo -> cortado -> plato
+simulation/ingredient.py — Ingrediente con estilo unlit + edge_color.
 """
 
 from ursina import Entity, Vec3, color
 from .physics import PhysicsWorld
 
-STATE_COLORS = {
-    "lechuga": {
-        "crudo":   color.rgb(50, 180, 50),
-        "cortado": color.rgb(30, 220, 30),
-        "plato":   color.rgb(255, 200, 50),
-    },
-    "tomate": {
-        "crudo":   color.rgb(200, 50, 50),
-        "cortado": color.rgb(240, 30, 30),
-        "plato":   color.rgb(255, 200, 50),
-    },
+INGREDIENT_COLORS = {
+    "lechuga": {"crudo": color.rgb(60, 190, 60), "cortado": color.rgb(30, 230, 30),
+                "plato": color.rgb(255, 210, 60)},
+    "tomate":  {"crudo": color.rgb(220, 50, 50), "cortado": color.rgb(250, 30, 30),
+                "plato": color.rgb(255, 210, 60)},
 }
 
-STATE_SCALE = {
-    "crudo":   0.6,
-    "cortado": 0.4,
-    "plato":   0.8,
-}
+STATE_SCALE = {"crudo": 0.6, "cortado": 0.45, "plato": 0.85}
 
 
 class Ingredient:
@@ -49,9 +38,10 @@ class Ingredient:
 
         self.visual = Entity(
             model="sphere",
-            color=STATE_COLORS[ingredient_type]["crudo"],
+            color=INGREDIENT_COLORS[ingredient_type]["crudo"],
             scale=STATE_SCALE["crudo"],
             position=Vec3(x, y + 0.5, z),
+            unlit=True, edge_color=color.black, edge_width=2,
         )
 
     def sync_visual(self):
@@ -68,7 +58,7 @@ class Ingredient:
         if new_state not in ("crudo", "cortado", "plato"):
             return
         self.state = new_state
-        self.visual.color = STATE_COLORS[self.ingredient_type][new_state]
+        self.visual.color = INGREDIENT_COLORS[self.ingredient_type][new_state]
         self.visual.scale = STATE_SCALE[new_state]
         if new_state == "plato":
             self.visual.model = "cube"
@@ -81,7 +71,8 @@ class Ingredient:
     def drop(self, world_pos):
         self.held_by = None
         self.visual.parent = None
-        self.physics.reset_body(self.body_id, (world_pos.x, world_pos.y + 0.3, world_pos.z))
+        self.physics.reset_body(self.body_id,
+                                (world_pos.x, world_pos.y + 0.3, world_pos.z))
         self.visual.position = Vec3(world_pos.x, world_pos.y + 0.3, world_pos.z)
 
     def reset(self):
@@ -90,7 +81,7 @@ class Ingredient:
         self.processing = False
         self.process_timer = 0.0
         self.visual.parent = None
-        self.visual.color = STATE_COLORS[self.ingredient_type]["crudo"]
+        self.visual.color = INGREDIENT_COLORS[self.ingredient_type]["crudo"]
         self.visual.scale = STATE_SCALE["crudo"]
         self.visual.model = "sphere"
         x, y, z = self.spawn_pos

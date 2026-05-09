@@ -1,16 +1,8 @@
 """
-RoboKitchen — MLH Hackathon 2026 | RoBorregos | Tec de Monterrey
+main.py — RoboKitchen — MLH Hackathon 2026 | RoBorregos | Tec de Monterrey
 
-Cocina robotica 3D: 4 robots en cadena preparan ensaladas.
-Grid 5x5 de celdas de 5x5x5m. Gemini supervisa el pipeline.
-
-Stack: Ursina (render) + PyBullet (fisica) + Gemini API (IA)
-
-Controles debug:
-  WASD = mover robot recolector
-  R    = reset
-  G    = toggle Gemini ON/OFF
-  ESC  = salir
+Cocina robotica 3D con camara orbital. Grid 5x5 texturizado.
+4 robots pipeline. Gemini IA. PyBullet fisica. Ursina render.
 """
 
 import threading
@@ -20,7 +12,7 @@ import sys
 try:
     from ursina import (Ursina, Entity, Vec3, color, time as utime,
                         held_keys, Text, camera, window, DirectionalLight,
-                        AmbientLight)
+                        AmbientLight, clamp)
 except ImportError:
     print("[ERROR] Ursina no instalado. pip install ursina")
     sys.exit(1)
@@ -42,14 +34,12 @@ CONFIG = {
     "fullscreen": False,
     "gemini_interval": 3.0,
     "physics_hz": 240,
-    "score_limit": 10,
 }
 
 
 class RoboKitchen:
 
     def __init__(self):
-        self.score = 0
         self.game_active = True
         self.gemini_enabled = True
         self._physics_lock = threading.Lock()
@@ -74,6 +64,8 @@ class RoboKitchen:
         print(f"  Gemini: {'ON' if self.gemini_enabled else 'OFF'}")
         print(f"  Pedidos pendientes: {self.order_manager.pending}")
 
+    # ── Init ─────────────────────────────────────────────────────────
+
     def _init_ursina(self):
         self.app = Ursina(
             title=CONFIG["window_title"],
@@ -84,15 +76,16 @@ class RoboKitchen:
         )
         window.fps_counter.enabled = True
         window.exit_button.visible = False
-        window.color = color.rgb(15, 18, 25)
+        window.color = color.dark_gray
 
-        camera.position = Vec3(-1, 22, -12)
-        camera.rotation_x = 60
-        camera.fov = 55
+        self.pivot = Entity()
+        camera.parent = self.pivot
+        camera.position = (0, 0, -22)
+        self.pivot.rotation_x, self.pivot.rotation_y = 38, 45
 
-        AmbientLight(color=color.rgba(200, 200, 220, 255))
-        main_light = DirectionalLight()
-        main_light.look_at(Vec3(0.5, -1, -0.5))
+        AmbientLight(color=color.rgba(190, 190, 210, 255))
+        dl = DirectionalLight()
+        dl.look_at(Vec3(0.5, -1, -0.5))
 
     def _init_physics(self):
         self.physics = PhysicsWorld()
@@ -140,6 +133,8 @@ class RoboKitchen:
             if cell.get("type") == "obstacle":
                 self.passable[row][col] = False
 
+    # ── Game Loop ────────────────────────────────────────────────────
+
     def update(self):
         if not self.game_active:
             return
@@ -147,7 +142,9 @@ class RoboKitchen:
         if dt <= 0 or dt > 0.1:
             return
 
-        self._handle_debug_input()
+        self._camera_orbit(dt)
+        self._wall_transparency()
+        self._handle_input()
         self._step_physics(dt)
         self._call_gemini_if_ready()
         self._apply_pending_commands()
@@ -158,22 +155,30 @@ class RoboKitchen:
         self._sync_all_visuals()
         self._update_ui(dt)
 
-    def _handle_debug_input(self):
+    def _camera_orbit(self, dt):
+        speed = 70 * dt
+        self.pivot.rotation_y += (held_keys["d"] - held_keys["a"] +
+                                  held_keys["right arrow"] - held_keys["left arrow"]) * speed
+        self.pivot.rotation_x += (held_keys["w"] - held_keys["s"] +
+                                  held_keys["up arrow"] - held_keys["down arrow"]) * speed
+        self.pivot.rotation_x = clamp(self.pivot.rotation_x, 15, 85)
+
+    def _wall_transparency(self):
+        pos = camera.world_position
+        for w in self.arena.wall_quads:
+            if w.eje == "x":
+                w.enabled = not ((w.dir == 1 and pos.x > w.position.x) or
+                                 (w.dir == -1 and pos.x < w.position.x))
+            elif w.eje == "z":
+                w.enabled = not ((w.dir == 1 and pos.z > w.position.z) or
+                                 (w.dir == -1 and pos.z < w.position.z))
+
+    def _handle_input(self):
         if held_keys["r"]:
             self.reset_game()
         if held_keys["g"]:
             self.gemini_enabled = not self.gemini_enabled
             print(f"[DEBUG] Gemini {'ON' if self.gemini_enabled else 'OFF'}")
-        r = self.robots[0]
-        speed = 8
-        if held_keys["w"]:
-            self.physics.apply_force(r.body_id, (speed, 0, 0))
-        if held_keys["s"]:
-            self.physics.apply_force(r.body_id, (-speed, 0, 0))
-        if held_keys["a"]:
-            self.physics.apply_force(r.body_id, (0, 0, -speed))
-        if held_keys["d"]:
-            self.physics.apply_force(r.body_id, (0, 0, speed))
 
     def _step_physics(self, dt):
         with self._physics_lock:
@@ -278,9 +283,8 @@ class RoboKitchen:
         robot._stop()
 
     def _assemble_plate(self, robot):
-        ensamble_cell = (1, 3)
-        if robot.current_cell != ensamble_cell:
-            self._navigate_robot(robot, ensamble_cell)
+        if robot.current_cell != (1, 3):
+            self._navigate_robot(robot, (1, 3))
             return
         cortados = [i for i in self.ingredients
                     if i.state == "cortado" and i.held_by is None]
@@ -288,18 +292,15 @@ class RoboKitchen:
         tomate = [i for i in cortados if i.ingredient_type == "tomate"]
         if lechuga and tomate and not self._assembled_ingredients:
             lechuga[0].set_state("plato")
-            self._assembled_ingredients.append(lechuga[0])
-            self._assembled_ingredients.append(tomate[0])
+            self._assembled_ingredients.extend([lechuga[0], tomate[0]])
         robot._stop()
 
     def _pickup_plate(self, robot):
-        ensamble_cell = (1, 3)
-        if robot.current_cell != ensamble_cell:
-            self._navigate_robot(robot, ensamble_cell)
+        if robot.current_cell != (1, 3):
+            self._navigate_robot(robot, (1, 3))
             return
         platos = [i for i in self.ingredients
-                  if i.state == "plato" and i.held_by is None
-                  and i.ingredient_type == "lechuga"]
+                  if i.state == "plato" and i.held_by is None]
         if platos and not robot.carrying:
             robot.pickup(platos[0])
             return
@@ -344,9 +345,8 @@ class RoboKitchen:
                     self._navigate_robot(robot, (3, 3))
 
     def _check_order_completions(self):
-        entregada = (3, 3)
         for robot in self.robots:
-            if robot.current_cell == entregada and robot.carrying:
+            if robot.current_cell == (3, 3) and robot.carrying:
                 if getattr(robot.carrying, "state", "") == "plato":
                     robot.drop_at(robot.get_position())
                     self.order_manager.complete()
@@ -366,22 +366,21 @@ class RoboKitchen:
                 ing.sync_visual()
 
     def _update_ui(self, dt):
-        robot_states = []
         role_colors_map = {
             "recolector":  [0.20, 0.50, 1.0],
             "cortador":    [1.0, 0.25, 0.25],
             "ensamblador": [0.20, 0.85, 0.25],
             "repartidor":  [1.0, 0.85, 0.15],
         }
+        robot_states = []
         for r in self.robots:
             robot_states.append({
-                "cell": r.current_cell,
-                "action": r.action,
+                "cell": r.current_cell, "action": r.action,
                 "carrying": r.carrying.ingredient_type if r.carrying else None,
                 "color": color.rgb(*role_colors_map.get(r.role, [1, 1, 1])),
                 "role": r.role,
             })
-        stations = {
+        st = {
             "corte_1": {"cell": [1, 1], "processing": any(
                 i.processing for i in self.ingredients), "has_plate": False, "collected": []},
             "corte_2": {"cell": [1, 2], "processing": False, "has_plate": False, "collected": []},
@@ -391,33 +390,23 @@ class RoboKitchen:
                              if i.state == "cortado" and i.held_by is None]},
         }
         self.hud.update(
-            fps=int(1 / max(dt, 0.001)),
-            score=self.order_manager.score,
-            pending=self.order_manager.pending,
-            completed=self.order_manager.completed,
-            gemini_enabled=self.gemini_enabled,
-            robots=robot_states,
-            stations=stations,
-        )
+            fps=int(1 / max(dt, 0.001)), score=self.order_manager.score,
+            pending=self.order_manager.pending, completed=self.order_manager.completed,
+            gemini_enabled=self.gemini_enabled, robots=robot_states, stations=st)
 
     def _build_game_state(self):
         with self._physics_lock:
-            robot_states = []
-            for r in self.robots:
-                robot_states.append({
-                    "id": r.robot_id, "role": r.role,
-                    "cell": list(r.current_cell), "action": r.action,
-                    "carrying": r.carrying.ingredient_type if r.carrying else None,
-                })
+            robot_states = [{"id": r.robot_id, "role": r.role,
+                             "cell": list(r.current_cell), "action": r.action,
+                             "carrying": r.carrying.ingredient_type if r.carrying else None}
+                            for r in self.robots]
             ing_states = []
             for ing in self.ingredients:
                 cell = ing.spawn_cell if ing.held_by else self.arena.get_cell_at(
                     ing.get_position().x, ing.get_position().z)
-                ing_states.append({
-                    "type": ing.ingredient_type, "state": ing.state,
-                    "cell": list(cell),
-                    "held_by": ing.held_by.robot_id if ing.held_by else None,
-                })
+                ing_states.append({"type": ing.ingredient_type, "state": ing.state,
+                                   "cell": list(cell),
+                                   "held_by": ing.held_by.robot_id if ing.held_by else None})
             stations = {
                 "corte_1": {"cell": [1, 1], "processing": any(
                     i.processing and i.held_by is None for i in self.ingredients)},
@@ -428,13 +417,8 @@ class RoboKitchen:
                                  if i.state == "cortado" and i.held_by is None]},
                 "entrega": {"cell": [3, 3]},
             }
-        return {
-            "orders": self.order_manager.get_state(),
-            "score": self.order_manager.score,
-            "robots": robot_states,
-            "ingredients": ing_states,
-            "stations": stations,
-        }
+        return {"orders": self.order_manager.get_state(), "score": self.order_manager.score,
+                "robots": robot_states, "ingredients": ing_states, "stations": stations}
 
     def reset_game(self):
         self.order_manager.reset()
