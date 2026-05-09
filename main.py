@@ -128,8 +128,9 @@ def heuristic(a, b):
     dr, dc = abs(a[0]-b[0]), abs(a[1]-b[1])
     return max(dr, dc) + (1.414-1)*min(dr, dc)
 
-def astar(start_world, goal_world):
-    """A* con danger map: penaliza rutas cercanas a paredes y obstáculos."""
+def astar(start_world, goal_world, extra_blocked=None):
+    """A* con danger map: penaliza rutas cercanas a paredes y obstáculos.
+    extra_blocked: set de (row, col) con celdas temporalmente bloqueadas (otros bots)."""
     start = world_to_cell(start_world.x, start_world.z)
     goal  = nearest_free_cell(world_to_cell(goal_world.x, goal_world.z))
     if goal is None:
@@ -162,6 +163,8 @@ def astar(start_world, goal_world):
                 if not (0 <= nr < GRID_ROWS and 0 <= nc < GRID_COLS):
                     continue
                 if NAV_GRID[nr][nc]:
+                    continue
+                if extra_blocked and (nr, nc) in extra_blocked:
                     continue
                 if dr != 0 and dc != 0:
                     if NAV_GRID[current[0]+dr][current[1]] or \
@@ -274,20 +277,24 @@ for face in faces_data:
 # ──────────────────────────────────────────────────────────────
 #  HELPER: CUBO ESTILO DIBUJO
 # ──────────────────────────────────────────────────────────────
+STATION_SCALE = 0.7
+STATION_Y = -half + STATION_SCALE * 0.5
+
 def Station(pos, col):
-    e = Entity(model='cube', color=col, position=pos, scale=1, unlit=True)
+    e = Entity(model='cube', color=col, position=pos, scale=STATION_SCALE,
+               unlit=True, edge_color=color.black, edge_width=2)
     register_obstacle(pos)
     return e
 
 # ──────────────────────────────────────────────────────────────
-#  ESTACIONES (posiciones fijas)
+#  ESTACIONES (posiciones fijas, más pequeñas, tocando el suelo)
 # ──────────────────────────────────────────────────────────────
-pos_tomate     = Vec3( 1, -half + 0.5, -2)
-pos_lechuga    = Vec3( 2, -half + 0.5, -2)
-pos_corte      = Vec3(-2, -half + 0.5, -2)
-pos_ensamblaje = Vec3(-2, -half + 0.5, -1)
-pos_platos     = Vec3(-2, -half + 0.5,  0)
-pos_entrega    = Vec3( 2, -half + 0.5,  1)
+pos_tomate     = Vec3( 1, STATION_Y, -2)
+pos_lechuga    = Vec3( 2, STATION_Y, -2)
+pos_corte      = Vec3(-2, STATION_Y, -2)
+pos_ensamblaje = Vec3(-2, STATION_Y, -1)
+pos_platos     = Vec3(-2, STATION_Y,  0)
+pos_entrega    = Vec3( 2, STATION_Y,  1)
 
 st_tomate     = Station(pos_tomate,     color.red)
 st_lechuga    = Station(pos_lechuga,    color.green)
@@ -297,20 +304,19 @@ st_platos     = Station(pos_platos,     color.white)
 st_entrega    = Station(pos_entrega,    color.azure)
 
 # ── Posiciones de ACCESO (frente a cada estación, lado interior) ──
-# Los bots navegan hasta aquí en lugar de al centro de la caja (que está bloqueado).
-# Offset +1 en Z = frente a la caja desde el interior de la cocina.
-_Y = -half + 0.5
-acc_tomate     = Vec3( 1.0, _Y, -1.3)   # tomate:     acceso desde el norte
-acc_lechuga    = Vec3( 2.0, _Y, -1.3)   # lechuga:    acceso desde el norte
-acc_corte      = Vec3(-1.3, _Y, -2.0)   # corte:      acceso desde el este
-acc_ensamblaje = Vec3(-1.3, _Y, -1.0)   # ensamblaje: acceso desde el este
-acc_platos     = Vec3(-1.3, _Y,  0.0)   # platos:     acceso desde el este
-acc_entrega    = Vec3( 1.3, _Y,  1.0)   # entrega:    acceso desde el oeste
+# Los bots navegan hasta aquí en lugar de al centro de la caja.
+_BOT_Y = -half + 0.25   # base del bot toca el suelo (scale=0.5)
+acc_tomate     = Vec3( 1.0, _BOT_Y, -1.3)
+acc_lechuga    = Vec3( 2.0, _BOT_Y, -1.3)
+acc_corte      = Vec3(-1.3, _BOT_Y, -2.0)
+acc_ensamblaje = Vec3(-1.3, _BOT_Y, -1.0)
+acc_platos     = Vec3(-1.3, _BOT_Y,  0.0)
+acc_entrega    = Vec3( 1.3, _BOT_Y,  1.0)
 
 # ── Posiciones de espera idle – fuera de las rutas de B1/B2 ──
-pos_idle_b2 = Vec3( 0.0, _Y,  2.0)
-pos_idle_b3 = Vec3( 1.5, _Y,  1.5)
-pos_idle_b4 = Vec3( 2.0, _Y,  0.5)
+pos_idle_b2 = Vec3( 0.0, _BOT_Y,  2.0)
+pos_idle_b3 = Vec3( 1.5, _BOT_Y,  1.5)
+pos_idle_b4 = Vec3( 2.0, _BOT_Y,  0.5)
 
 # Pared interna gris (obstáculo)
 gray_wall = Entity(model='cube', color=color.gray,
@@ -371,18 +377,34 @@ class BotBase:
     def __init__(self):
         self.waypoints = []   # lista de Vec3 generada por A*
         self._destino_final = None
+        self._last_pos = None
+        self._stuck_t = 0.0
         all_bots.append(self)
 
-    def set_destino(self, target: Vec3):
-        """Calcula ruta A* hacia target y establece los waypoints."""
-        if target == self._destino_final:
-            return   # ya tiene la ruta calculada
+    def _blocked_by_bots(self):
+        """Retorna set de celdas ocupadas por otros bots."""
+        blocked = set()
+        for bot in all_bots:
+            if bot is self:
+                continue
+            r, c = world_to_cell(bot.e.position.x, bot.e.position.z)
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < GRID_ROWS and 0 <= nc < GRID_COLS:
+                        blocked.add((nr, nc))
+        return blocked
+
+    def set_destino(self, target: Vec3, force=False):
+        """Calcula ruta A* hacia target, evitando otros bots."""
+        if not force and target == self._destino_final:
+            return
         self._destino_final = target
-        path = astar(self.e.position, target)
+        blocked = self._blocked_by_bots()
+        path = astar(self.e.position, target, extra_blocked=blocked)
         if path:
             self.waypoints = path
         else:
-            # Fallback: línea recta
             self.waypoints = [target]
 
     def mover(self, dt):
@@ -408,6 +430,21 @@ class BotBase:
             # Separación con otros bots
             apply_bot_separation(self, dt)
 
+            # Detectar atasco
+            if self._last_pos is None:
+                self._last_pos = self.e.position
+            d_moved = (self.e.position - self._last_pos).length()
+            if d_moved < 0.02:
+                self._stuck_t += dt
+            else:
+                self._stuck_t = 0.0
+                self._last_pos = self.e.position
+
+            # Recalcular si está atascado > 0.4s
+            if self._stuck_t > 0.4 and self._destino_final:
+                self._stuck_t = 0.0
+                self.set_destino(self._destino_final, force=True)
+
             # Llevar la carga encima
             if hasattr(self, 'carga') and self.carga:
                 self.carga.position = self.e.position + Vec3(0, 0.5, 0)
@@ -418,15 +455,15 @@ class BotBase:
         else:
             # Waypoint alcanzado
             self.waypoints.pop(0)
+            self._stuck_t = 0.0
             if not self.waypoints:
-                # Llegó al destino final, snap suave
                 dest = self._destino_final
                 self.e.position = Vec3(dest.x, self.e.position.y, dest.z)
                 if hasattr(self, 'carga') and self.carga:
                     self.carga.position = self.e.position + Vec3(0, 0.5, 0)
                 apply_bot_separation(self, dt)
-                return False   # llegó
-            return True   # aún quedan waypoints
+                return False
+            return True
 
     @property
     def llegó(self):
@@ -441,10 +478,10 @@ class Bot1(BotBase):
     def __init__(self):
         super().__init__()
         self.e = Entity(model='cube', color=color.orange,
-                        position=Vec3(0, -half + 0.5, 2),
-                        scale=0.5, unlit=True)
+                        position=Vec3(0, _BOT_Y, 2),
+                        scale=0.5, unlit=True, edge_color=color.black, edge_width=2)
         self.label = Text(text='B1', world_parent=self.e,
-                          position=(0, 1.4, 0), scale=6,
+                          position=(0, 0.7, 0), scale=6,
                           billboard=True, color=color.white)
         self.estado = EstadoBot1.IR_TOMATE
         self.carga  = None
@@ -508,10 +545,10 @@ class Bot2(BotBase):
     def __init__(self):
         super().__init__()
         self.e = Entity(model='cube', color=color.magenta,
-                        position=Vec3(0, -half + 0.5, 1.5),
-                        scale=0.5, unlit=True)
+                        position=Vec3(0, _BOT_Y, 1.5),
+                        scale=0.5, unlit=True, edge_color=color.black, edge_width=2)
         self.label = Text(text='B2', world_parent=self.e,
-                          position=(0, 1.4, 0), scale=6,
+                          position=(0, 0.7, 0), scale=6,
                           billboard=True, color=color.white)
         self.estado = EstadoBot2.ESPERAR
         self.carga  = None
@@ -589,10 +626,10 @@ class Bot3(BotBase):
     def __init__(self):
         super().__init__()
         self.e = Entity(model='cube', color=color.cyan,
-                        position=Vec3(1, -half + 0.5, 0),
-                        scale=0.5, unlit=True)
+                        position=Vec3(1, _BOT_Y, 0),
+                        scale=0.5, unlit=True, edge_color=color.black, edge_width=2)
         self.label = Text(text='B3', world_parent=self.e,
-                          position=(0, 1.4, 0), scale=6,
+                          position=(0, 0.7, 0), scale=6,
                           billboard=True, color=color.white)
         self.estado = EstadoBot3.ESPERAR
         self.carga  = None
@@ -659,10 +696,10 @@ class Bot4(BotBase):
     def __init__(self):
         super().__init__()
         self.e = Entity(model='cube', color=color.violet,
-                        position=Vec3(-1, -half + 0.5, 1),
-                        scale=0.5, unlit=True)
+                        position=Vec3(-1, _BOT_Y, 1),
+                        scale=0.5, unlit=True, edge_color=color.black, edge_width=2)
         self.label = Text(text='B4', world_parent=self.e,
-                          position=(0, 1.4, 0), scale=6,
+                          position=(0, 0.7, 0), scale=6,
                           billboard=True, color=color.white)
         self.estado = EstadoBot4.ESPERAR
         self.cargas = []
