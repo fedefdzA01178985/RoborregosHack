@@ -232,48 +232,55 @@ class GeminiAgent:
         "Eres el chef de RoboKitchen: 4 robots hacen ensaladas en cadena.\n"
         "ROBOTS: 0=RECOLECTOR(rapido),1=CORTADOR(medio),2=ENSAMBLADOR(medio),3=REPARTIDOR(rapido).\n"
         "PIPELINE: ALMACEN(x>0,z=-2)->RECOGER->CORTE(-2,-2)->CORTAR 2s->ENSAMBLAJE(-2,-1)->ARMAR->PLATO->ENTREGA(2,1).\n"
-        "PLATOS(-2,0) = donde REPARTIDOR recoge plato vacio para llevar a ENSAMBLAJE.\n"
+        "PLATOS(-2,0) = donde ENSAMBLADOR recoge plato vacio para llevar a ENSAMBLAJE.\n"
         "PARED en x=0 de z=-2.5 a z=0. Rodear por z>0.\n"
         "RESPONDE SOLO JSON array: [{\"robot_id\":0,\"action\":\"pickup\",\"target\":[x,z]}, ...]\n"
         "Acciones: pickup, deliver, process, assemble, pickup_plate, goto, wait, idle"
     )
+    PROJECT = "neural-pattern-495817-k4"
+    LOCATION = "us-central1"
+    MODEL = "gemini-2.0-flash"
 
     def __init__(self):
         import os
-        from dotenv import load_dotenv
-        load_dotenv()
-        import google.generativeai as genai
-        key = os.getenv("GEMINI_API_KEY")
-        if not key: raise EnvironmentError("GEMINI_API_KEY no en .env")
-        genai.configure(api_key=key)
-        self.model = genai.GenerativeModel(model_name="gemini-2.0-flash", system_instruction=self.SYS)
+        from google import genai
+        from google.genai import types
+        self._genai = genai
+        self._types = types
+        os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "true")
+        os.environ.setdefault("GOOGLE_CLOUD_PROJECT", self.PROJECT)
+        os.environ.setdefault("GOOGLE_CLOUD_LOCATION", self.LOCATION)
         self.calls = 0; self._err_shown = False; self._ok = False
-        # ── health check ──
         try:
-            test = self.model.generate_content("Responde solo: OK", generation_config=genai.GenerationConfig(
-                temperature=0, max_output_tokens=10))
-            if "OK" in test.text.upper():
-                self._ok = True; print("[Gemini] API OK — listo para usar")
+            self.client = genai.Client(vertexai=True, project=self.PROJECT, location=self.LOCATION)
+            test = self.client.models.generate_content(
+                model=self.MODEL,
+                contents="Responde solo: OK",
+                config=types.GenerateContentConfig(temperature=0, max_output_tokens=10))
+            if "OK" in (test.text or "").upper():
+                self._ok = True; print("[Gemini] Vertex AI OK — listo para usar")
             else:
-                print("[Gemini] API respondio pero sin OK — fallback manual activo")
+                print("[Gemini] Vertex respondio pero sin OK — fallback manual activo")
         except Exception as e:
-            print(f"[Gemini] API NO disponible ({type(e).__name__}) — fallback manual activo")
+            print(f"[Gemini] Vertex NO disponible ({type(e).__name__}) — fallback manual activo")
 
     def decide(self, state):
         self.calls += 1
-        import google.generativeai as genai
-        prompt = f"=== #{self.calls} ===\n{json.dumps(state,indent=2)}\n\nJSON array:"
+        prompt = f"{self.SYS}\n=== #{self.calls} ===\n{json.dumps(state,indent=2)}\n\nJSON array:"
         try:
-            r = self.model.generate_content(prompt, generation_config=genai.GenerationConfig(
-                temperature=0.2, max_output_tokens=300))
+            r = self.client.models.generate_content(
+                model=self.MODEL,
+                contents=prompt,
+                config=self._types.GenerateContentConfig(temperature=0.2, max_output_tokens=300))
             return self._parse(r.text)
         except Exception as e:
             if not self._err_shown:
-                print(f"[Gemini] Error API ({type(e).__name__}) — usando pipeline manual"); self._err_shown = True
+                print(f"[Gemini] Error Vertex ({type(e).__name__}) — usando pipeline manual")
+                self._err_shown = True
             return self._fallback(state)
 
     def _parse(self, t):
-        t = t.strip()
+        t = (t or "").strip()
         if t.startswith("```"):
             p = t.split("```"); t = p[1] if len(p)>=2 else t
             if t.startswith("json"): t = t[4:]
