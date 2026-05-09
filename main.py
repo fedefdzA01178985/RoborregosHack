@@ -37,8 +37,12 @@ GRID_RES  = 0.25
 GRID_COLS = int(size / GRID_RES)   # 20
 GRID_ROWS = int(size / GRID_RES)   # 20
 
+# Radio del bot: escala 0.5 → radio real 0.25, más margen mínimo
+BOT_RADIUS = 0.26
+
 WALL_MARGIN   = 0.30
-GRAY_X_MARGIN = 0.38
+# Pared gris: scale_x=0.1 → half-extent=0.05. Con radio del bot + margen de seguridad:
+GRAY_X_MARGIN = 0.05 + BOT_RADIUS + 0.05   # ≈ 0.36
 GRAY_Z_MIN, GRAY_Z_MAX = -2.5, 0.0
 
 # Parámetros del danger map
@@ -49,7 +53,7 @@ def _cell_center(row, col):
     return (-half + (col + 0.5) * GRID_RES,
             -half + (row + 0.5) * GRID_RES)
 
-def _build_grids():
+def _build_grids(station_positions=None):
     from collections import deque
 
     blocked = [[False]*GRID_COLS for _ in range(GRID_ROWS)]
@@ -61,6 +65,17 @@ def _build_grids():
                 blocked[r][c] = True
             elif abs(wx) < GRAY_X_MARGIN and GRAY_Z_MIN <= wz <= GRAY_Z_MAX:
                 blocked[r][c] = True
+
+    # Bloquear celdas ocupadas por estaciones (scale=0.7 → half=0.35)
+    if station_positions:
+        st_half = STATION_SCALE * 0.5 + BOT_RADIUS
+        for r in range(GRID_ROWS):
+            for c in range(GRID_COLS):
+                wx, wz = _cell_center(r, c)
+                for sp in station_positions:
+                    if abs(wx - sp.x) < st_half and abs(wz - sp.z) < st_half:
+                        blocked[r][c] = True
+                        break
 
     # BFS desde frontera de celdas bloqueadas → mapa de distancia
     dist   = [[999]*GRID_COLS for _ in range(GRID_ROWS)]
@@ -101,7 +116,7 @@ def _build_grids():
 
     return blocked, danger
 
-NAV_GRID, DANGER_GRID = _build_grids()
+NAV_GRID, DANGER_GRID = None, None  # se calcula después de crear estaciones
 
 def world_to_cell(wx, wz):
     col = int((wx + half) / GRID_RES)
@@ -185,9 +200,6 @@ def astar(start_world, goal_world, extra_blocked=None):
 # ──────────────────────────────────────────────────────────────
 #  COLISIONES: lista de obstáculos estáticos (cajas 1x1x1)
 # ──────────────────────────────────────────────────────────────
-# Radio del bot: escala 0.5 → radio real 0.25, más margen mínimo
-BOT_RADIUS = 0.26
-
 static_obstacles = []   # lista de Vec3 (centro XZ de cada estación)
 all_bots = []           # lista de todas las instancias BotBase (se llena al crear cada bot)
 
@@ -302,6 +314,10 @@ st_corte      = Station(pos_corte,      color.yellow)
 st_ensamblaje = Station(pos_ensamblaje, color.brown)
 st_platos     = Station(pos_platos,     color.white)
 st_entrega    = Station(pos_entrega,    color.azure)
+
+# Construir navgrid AHORA que las estaciones existen
+station_positions = [pos_tomate, pos_lechuga, pos_corte, pos_ensamblaje, pos_platos, pos_entrega]
+NAV_GRID, DANGER_GRID = _build_grids(station_positions)
 
 # ── Posiciones de ACCESO (frente a cada estación, lado interior) ──
 # Los bots navegan hasta aquí en lugar de al centro de la caja.
