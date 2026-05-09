@@ -160,8 +160,8 @@ class Arena:
                 continue
             cx, _, cz = self.cell_center_3d(row, col)
             marker_color = STATION_MARKER_COLORS.get(tp, color.white)
-            Entity(model="cylinder", color=marker_color,
-                   scale=(0.2, 2.5, 0.2),
+            Entity(model="cube", color=marker_color,
+                   scale=(0.15, 2.5, 0.15),
                    position=Vec3(cx + self.cw*0.35, 1.25, cz))
             label_text = cell.get("label", tp)
             Entity(model="quad", color=color.white,
