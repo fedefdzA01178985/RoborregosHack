@@ -264,105 +264,44 @@ class Ingredient:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class GeminiAgent:
-    SYS = (
-        "Eres un arquitecto de cocina robotica. Genera escenarios variados para RoboKitchen.\n"
-        "Responde SOLO con este JSON exacto:\n"
-        "{\n"
-        '  "stations": {\n'
-        '    "almacen_tomate":  [x, z],\n'
-        '    "almacen_lechuga": [x, z],\n'
-        '    "corte":           [x, z],\n'
-        '    "ensamblaje":      [x, z],\n'
-        '    "platos":          [x, z],\n'
-        '    "entrega":         [x, z]\n'
-        "  },\n"
-        '  "obstacles": [\n'
-        '    {"x": num, "z": num, "scale": [w, h, d]}, ...\n'
-        "  ]\n"
-        "}\n"
-        "Reglas:\n"
-        "- x entre -2 y 2, z entre -2 y 2.\n"
-        "- almacenes: x > 0 (zona derecha).\n"
-        "- corte/ensamblaje/platos: x < 0 (zona izquierda).\n"
-        "- entrega: x > 0, z > 0.\n"
-        "- 2-4 obstaculos, scale entre [0.3,0.3,0.3] y [1.0,0.3,1.0].\n"
-        "- Deja pasillo central libre (z>0 o z<0)."
-    )
-    MODEL = "gemini-2.0-flash"
+    """Generador manual de escenarios (sin API). Cuota agotada → random local."""
 
     def __init__(self):
-        import os
-        from dotenv import load_dotenv
-        load_dotenv()
-        from google import genai
-        key = os.getenv("GEMINI_API_KEY")
-        if not key:
-            print("[Gemini] GEMINI_API_KEY no en .env — scenario manual activo")
-            self._ok = False; self.client = None; return
-        try:
-            self.client = genai.Client(api_key=key)
-            test = self.client.models.generate_content(
-                model=self.MODEL,
-                contents="Responde: OK",
-                config=genai.types.GenerateContentConfig(temperature=0, max_output_tokens=10))
-            if "OK" in (test.text or "").upper():
-                self._ok = True; print("[Gemini] API OK — scenario architect listo")
-            else:
-                self._ok = False; print("[Gemini] API respondio pero sin OK")
-        except Exception as e:
-            self._ok = False
-            print(f"[Gemini] API NO disponible ({type(e).__name__}) — scenario manual activo")
+        self._ok = False  # No usamos API
+        print("[Gemini] Modo MANUAL — randomizacion local activa (presiona R)")
 
     def generate_scenario(self):
-        if not self._ok or not self.client:
-            return self._default_scenario()
-        prompt = self.SYS + "\n\nGenera escenario aleatorio:"
-        try:
-            r = self.client.models.generate_content(
-                model=self.MODEL,
-                contents=prompt,
-                config=genai.types.GenerateContentConfig(temperature=0.9, max_output_tokens=400))
-            data = self._parse(r.text)
-            if data: return data
-        except Exception as e:
-            print(f"[Gemini] Error generando escenario: {type(e).__name__}")
-        return self._default_scenario()
+        """Genera escenario aleatorio localmente."""
+        # Zonas: almacenes x>0, corte/ensamblaje/platos x<0, entrega x>0 z>0
+        def rand_x(min_x, max_x):
+            return round(random.uniform(min_x, max_x), 1)
+        def rand_z(min_z, max_z):
+            return round(random.uniform(min_z, max_z), 1)
 
-    def _parse(self, t):
-        t = (t or "").strip()
-        if t.startswith("```"):
-            p = t.split("```"); t = p[1] if len(p)>=2 else t
-            if t.startswith("json"): t = t[4:]
-        t = t.strip()
-        try:
-            d = json.loads(t)
-            if "stations" in d and "obstacles" in d:
-                return d
-        except:
-            import re; m = re.search(r"\{.*\}", t, re.DOTALL)
-            if m:
-                try:
-                    d = json.loads(m.group())
-                    if "stations" in d and "obstacles" in d:
-                        return d
-                except: pass
-        return None
-
-    def _default_scenario(self):
-        return {
-            "stations": {
-                "almacen_tomate":  [1.0, -2.0],
-                "almacen_lechuga": [2.0, -2.0],
-                "corte":           [-2.0, -2.0],
-                "ensamblaje":      [-2.0, -1.0],
-                "platos":          [-2.0, 0.0],
-                "entrega":         [2.0, 1.0],
-            },
-            "obstacles": [
-                {"x": 0.0, "z": 1.5, "scale": [0.6, 0.3, 0.6]},
-                {"x": -1.0, "z": 1.5, "scale": [0.6, 0.3, 0.6]},
-            ]
+        stations = {
+            "almacen_tomate":  [rand_x(0.5, 2.0), rand_z(-2.0, -0.5)],
+            "almacen_lechuga": [rand_x(0.5, 2.0), rand_z(-2.0, -0.5)],
+            "corte":           [rand_x(-2.0, -0.5), rand_z(-2.0, -0.5)],
+            "ensamblaje":      [rand_x(-2.0, -0.5), rand_z(-1.5, 0.5)],
+            "platos":          [rand_x(-2.0, -0.5), rand_z(-0.5, 1.5)],
+            "entrega":         [rand_x(0.5, 2.0), rand_z(0.5, 2.0)],
         }
+
+        n_obs = random.randint(2, 4)
+        obstacles = []
+        for _ in range(n_obs):
+            ox = rand_x(-1.8, 1.8)
+            oz = rand_z(-1.8, 1.8)
+            # Evitar que obstáculos tapen el pasillo central
+            if abs(ox) < 0.5:
+                ox = random.choice([-1.0, 1.0])
+            obstacles.append({
+                "x": ox,
+                "z": oz,
+                "scale": [round(random.uniform(0.3, 0.8), 1), 0.3, round(random.uniform(0.3, 0.8), 1)]
+            })
+
+        return {"stations": stations, "obstacles": obstacles}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SCENARIO — aplica escenarios al mundo
@@ -479,6 +418,13 @@ Entity(model="cube", color=color.gray,
        position=(0,0,-1.25), scale=(0.1,WALL_H,WALL_H/2),
        unlit=True, edge_color=color.black, edge_width=2)
 
+# ── Física ───────────────────────────────────────────────────────────────────
+pw = PhysicsWorld()
+hw = WALL_H/2
+
+# Piso físico
+pw.box((ARENA_HALF + 0.5, 0.1, ARENA_HALF + 0.5), 0, (0, FLOOR_Y - 0.1, 0))
+
 # ── Estaciones (guardar referencias para Scenario) ───────────────────────────
 stations_vis = {}
 stations_text = {}
@@ -514,13 +460,6 @@ pivot = Entity()
 camera.parent = pivot
 camera.position = (0,0,-18)
 pivot.rotation_x, pivot.rotation_y = 35, 45
-
-# ── Física ───────────────────────────────────────────────────────────────────
-pw = PhysicsWorld()
-hw = WALL_H/2
-
-# Piso físico
-pw.box((ARENA_HALF + 0.5, 0.1, ARENA_HALF + 0.5), 0, (0, FLOOR_Y - 0.1, 0))
 
 # Paredes perimetrales
 for wx, wz in [(ARENA_HALF + 0.15, 0), (-(ARENA_HALF + 0.15), 0),
