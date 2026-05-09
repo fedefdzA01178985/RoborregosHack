@@ -40,9 +40,12 @@ ROBOT_COLORS  = {
     "ensamblador": color.rgb(50, 210, 60),
     "repartidor":  color.rgb(240, 210, 30),
 }
+ROBOT_Y = FLOOR_Y + 0.35
 ROBOT_STARTS  = [
-    Vec3(1.5, -1.5, -1.5), Vec3(-1.5, -1.5, -1.5),
-    Vec3(-1.5, -1.5, -1.0), Vec3(1.5, -1.5, 1.0),
+    Vec3(2.0,  ROBOT_Y, 2.2),   # recolector  — lejos almacen
+    Vec3(0.7,  ROBOT_Y, 2.2),   # cortador    — lejos corte
+    Vec3(-0.7, ROBOT_Y, 2.2),   # ensamblador — lejos ensamblaje/platos
+    Vec3(-2.0, ROBOT_Y, 2.2),   # repartidor  — lejos entrega
 ]
 STATIONS = {
     "almacen_tomate":  Vec3(1.0, OBJ_Y, -2.0),
@@ -244,7 +247,17 @@ class GeminiAgent:
         if not key: raise EnvironmentError("GEMINI_API_KEY no en .env")
         genai.configure(api_key=key)
         self.model = genai.GenerativeModel(model_name="gemini-2.0-flash", system_instruction=self.SYS)
-        self.calls = 0; self._err_shown = False; print("[Gemini] OK")
+        self.calls = 0; self._err_shown = False; self._ok = False
+        # ── health check ──
+        try:
+            test = self.model.generate_content("Responde solo: OK", generation_config=genai.GenerationConfig(
+                temperature=0, max_output_tokens=10))
+            if "OK" in test.text.upper():
+                self._ok = True; print("[Gemini] API OK — listo para usar")
+            else:
+                print("[Gemini] API respondio pero sin OK — fallback manual activo")
+        except Exception as e:
+            print(f"[Gemini] API NO disponible ({type(e).__name__}) — fallback manual activo")
 
     def decide(self, state):
         self.calls += 1
@@ -256,7 +269,7 @@ class GeminiAgent:
             return self._parse(r.text)
         except Exception as e:
             if not self._err_shown:
-                print(f"[Gemini] Sin creditos — usando pipeline manual"); self._err_shown = True
+                print(f"[Gemini] Error API ({type(e).__name__}) — usando pipeline manual"); self._err_shown = True
             return self._fallback(state)
 
     def _parse(self, t):
@@ -278,16 +291,33 @@ class GeminiAgent:
         rs = {r["id"]:r for r in s.get("robots",[])}; pending = s.get("orders",{}).get("pending",0)
         if pending <= 0: return [{"robot_id":i,"action":"idle"} for i in range(4)]
         cmds = []
-        r0 = rs.get(0,{}); r1 = rs.get(1,{})
-        crudos = [i for i in s.get("ingredients",[]) if i.get("state")=="crudo" and not i.get("held_by")]
+        r0 = rs.get(0,{}); r1 = rs.get(1,{}); r2 = rs.get(2,{}); r3 = rs.get(3,{})
+        ings = s.get("ingredients",[])
+        crudos = [i for i in ings if i.get("state")=="crudo" and not i.get("held_by")]
+        cortados = [i for i in ings if i.get("state")=="cortado" and not i.get("held_by")]
+        # 0 recolector
         if crudos and not r0.get("carrying"):
             cmds.append({"robot_id":0,"action":"pickup","target":crudos[0]["pos"]})
         elif r0.get("carrying"):
             cmds.append({"robot_id":0,"action":"deliver","target":"corte"})
         else: cmds.append({"robot_id":0,"action":"idle"})
-        cmds.append({"robot_id":1,"action":"process" if r1.get("carrying") else "idle"})
-        cmds.append({"robot_id":2,"action":"idle"})
-        cmds.append({"robot_id":3,"action":"idle"})
+        # 1 cortador
+        if r1.get("carrying"):
+            cmds.append({"robot_id":1,"action":"process"})
+        else:
+            cmds.append({"robot_id":1,"action":"goto","target":"corte"})
+        # 2 ensamblador
+        if not r2.get("carrying_plate") and not r2.get("carrying"):
+            cmds.append({"robot_id":2,"action":"pickup_plate","target":"platos"})
+        elif r2.get("carrying_plate") and cortados:
+            cmds.append({"robot_id":2,"action":"assemble","target":"ensamblaje"})
+        else: cmds.append({"robot_id":2,"action":"idle"})
+        # 3 repartidor
+        if not r3.get("carrying_plate") and not r3.get("carrying"):
+            cmds.append({"robot_id":3,"action":"goto","target":"ensamblaje"})
+        elif r3.get("carrying_plate"):
+            cmds.append({"robot_id":3,"action":"deliver","target":"entrega"})
+        else: cmds.append({"robot_id":3,"action":"idle"})
         return cmds
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -512,11 +542,12 @@ def _try_pickup(r):
 def _apply_cmds():
     global _cmds
     with _glock: cmds = _cmds.copy(); _cmds.clear()
+    now = time.time()
     for c in cmds:
         rid = c.get("robot_id",0); act = c.get("action","idle")
         tgt = c.get("target"); stn = c.get("station",tgt)
         if rid >= len(robots): continue
-        r = robots[rid]; r.action = act
+        r = robots[rid]; r.action = act; r._last_cmd_t = now
         if act in ("goto","pickup","deliver"):
             tp = _resolve_target(tgt, stn)
             if tp is None: r.stop(); continue
@@ -524,7 +555,7 @@ def _apply_cmds():
             if act == "pickup":
                 if r.role == "ensamblador" and r.station == "platos":
                     _try_pickup_plate(r)
-                elif r.station in ("almacen",):
+                elif r.station in ("almacen","corte"):
                     _try_pickup(r)
             elif act == "deliver" and (r.pos()-tp).length() < 1.0:
                 if r.carrying: r.drop(r.pos())
@@ -538,6 +569,8 @@ def _apply_cmds():
             if lech and tom and r.carrying_plate and not r.carrying_plate.food:
                 r.carrying_plate.food = True
                 r.carrying_plate.vis.color = color.rgb(255, 210, 60)
+                lech[0].reset(); tom[0].reset()
+                r.carrying_plate.drop(r.pos())
         elif act == "pickup_plate" and r.station in ("platos","ensamblaje"):
             _try_pickup_plate(r)
         else: r.stop()
@@ -549,33 +582,56 @@ def _try_pickup_plate(r):
             p.pickup(r); return
 
 def _pipeline():
+    now = time.time()
     ensamblador = robots[2]
     repartidor = robots[3]
 
     for r in robots:
+        # skip if Gemini gave a command recently (<1s)
+        if getattr(r, "_last_cmd_t", 0) and now - r._last_cmd_t < 1.0:
+            continue
         if r.role == "recolector" and not r.carrying:
             crudos = [i for i in ingredients if i.state=="crudo" and not i.held]
             if crudos and orders.pending > 0:
                 _navigate(r, crudos[0].spawn)
                 if r.station == "almacen": _try_pickup(r)
-        if r.role == "cortador" and not r.carrying and r.station == "corte":
-            for ing in ingredients:
-                if not ing.held and ing.state == "crudo":
-                    if (r.pos()-ing.pos()).length() < 1.5: r.pickup(ing)
+        if r.role == "cortador" and not r.carrying:
+            _navigate(r, STATIONS["corte"])
+            if r.station == "corte":
+                for ing in ingredients:
+                    if not ing.held and ing.state == "crudo":
+                        if (r.pos()-ing.pos()).length() < 1.5: r.pickup(ing)
 
-    free_plates = [p for p in plates if not p.held and not p.food]
-    if free_plates and not ensamblador.carrying_plate:
-        _navigate(ensamblador, STATIONS["platos"])
-        if ensamblador.station == "platos": _try_pickup_plate(ensamblador)
+    if not (getattr(ensamblador, "_last_cmd_t", 0) and now - ensamblador._last_cmd_t < 1.0):
+        if ensamblador.carrying_plate and ensamblador.carrying_plate.food:
+            if ensamblador.station == "ensamblaje":
+                ensamblador.carrying_plate.drop(ensamblador.pos())
+            else:
+                _navigate(ensamblador, STATIONS["ensamblaje"])
+        elif not ensamblador.carrying_plate:
+            free_plates = [p for p in plates if not p.held and not p.food]
+            if free_plates:
+                _navigate(ensamblador, STATIONS["platos"])
+                if ensamblador.station == "platos": _try_pickup_plate(ensamblador)
+            elif ensamblador.station == "ensamblaje" and ensamblador.carrying_plate and not ensamblador.carrying_plate.food:
+                # try assemble if ingredients ready
+                cort = [i for i in ingredients if i.state=="cortado" and not i.held]
+                lech = [i for i in cort if i.itype=="lechuga"]
+                tom = [i for i in cort if i.itype=="tomate"]
+                if lech and tom:
+                    ensamblador.carrying_plate.food = True
+                    ensamblador.carrying_plate.vis.color = color.rgb(255, 210, 60)
+                    lech[0].reset(); tom[0].reset()
+                    ensamblador.carrying_plate.drop(ensamblador.pos())
 
-    assembled = [p for p in plates if p.food and not p.held]
-    if assembled and not repartidor.carrying_plate:
-        _navigate(repartidor, assembled[0].pos())
-        if repartidor.station == "ensamblaje":
+    if not (getattr(repartidor, "_last_cmd_t", 0) and now - repartidor._last_cmd_t < 1.0):
+        assembled = [p for p in plates if p.food and not p.held]
+        if assembled and not repartidor.carrying_plate:
+            _navigate(repartidor, assembled[0].pos())
             if (repartidor.pos() - assembled[0].pos()).length() < 1.5:
                 assembled[0].pickup(repartidor)
-    elif repartidor.carrying_plate:
-        _navigate(repartidor, STATIONS["entrega"])
+        elif repartidor.carrying_plate:
+            _navigate(repartidor, STATIONS["entrega"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  UPDATE (Ursina game loop)
