@@ -2,6 +2,8 @@ from ursina import *
 from enum import Enum, auto
 import heapq
 from math import degrees, atan2
+import json
+import urllib.request
 
 app = Ursina()
 
@@ -905,17 +907,75 @@ def actualizar_contador():
 def actualizar_score():
     score_text.text = f"⭐ Puntos: {score}"
 
-def randomize_scenario():
-    global pos_tomate, pos_lechuga, pos_corte, pos_ensamblaje, pos_platos, pos_entrega
-    global acc_tomate, acc_lechuga, acc_corte, acc_ensamblaje, acc_platos, acc_entrega
-    global NAV_GRID, DANGER_GRID, static_obstacles
-    global tiempo_restante, juego_activo, pedidos_completados, score
-    global cola_corte, cola_ensamblaje, cola_platos, plato_actual, all_ingredientes
+GEMINI_API_KEY = "AIzaSyDXk15jYt4WyaAMj8zOkFRnwrUysvupve0"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+def call_gemini_for_scenario():
+    """Llama a Gemini API para generar un escenario. Retorna dict o None."""
+    prompt = (
+        "Genera un escenario para un juego tipo Overcooked en una cuadrícula de 5x5 unidades. "
+        "Necesito 6 estaciones pegadas a las paredes exteriores (no en el centro), "
+        "y una pared gris interna como obstáculo. "
+        "Responde ÚNICAMENTE con un objeto JSON válido sin markdown, con esta estructura exacta:\n\n"
+        "{\n"
+        '  "stations": [\n'
+        '    {"name": "tomate",     "x": number, "z": number},\n'
+        '    {"name": "lechuga",    "x": number, "z": number},\n'
+        '    {"name": "corte",      "x": number, "z": number},\n'
+        '    {"name": "ensamblaje", "x": number, "z": number},\n'
+        '    {"name": "platos",     "x": number, "z": number},\n'
+        '    {"name": "entrega",    "x": number, "z": number}\n'
+        "  ],\n"
+        '  "gray_wall": {\n'
+        '    "center_x": number,\n'
+        '    "z_min": number,\n'
+        '    "z_max": number\n'
+        "  }\n"
+        "}\n\n"
+        "Restricciones:\n"
+        "- Todas las estaciones deben estar en los bordes de la cuadrícula: x o z debe ser 2.0 o -2.0 (o muy cercano, como ±1.6 a ±2.0).\n"
+        "- Ninguna estación debe quedar en el centro (|x| < 1.5 y |z| < 1.5).\n"
+        "- Las estaciones deben estar separadas al menos 0.8 unidades entre sí.\n"
+        "- La pared gris debe tener center_x entre -1.8 y 1.8, y z_min/z_max entre -2.2 y 2.2, con z_max > z_min + 1.0.\n"
+        "- Ninguna estación debe quedar a menos de 0.7 unidades de la pared gris.\n"
+        "Genera valores diversos e interesantes para cada escenario."
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.9, "maxOutputTokens": 512}
+    }
+
+    try:
+        req = urllib.request.Request(
+            GEMINI_URL,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        # Limpiar posible markdown
+        text = text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        scenario = json.loads(text)
+        return scenario
+    except Exception as e:
+        print("[Gemini Error]", e)
+        return None
+
+
+def _manual_randomize():
+    """Randomización manual de respaldo."""
     global gray_wall_center_x, GRAY_Z_MIN, GRAY_Z_MAX
-
     import random
-
-    # ── Randomizar pared gris interna ──
     gray_wall_center_x = random.choice([-1.6, -0.8, 0.0, 0.8, 1.6])
     gray_span = random.uniform(1.5, min(4.0, size - 0.5))
     GRAY_Z_MIN = round(random.uniform(-half + 0.3, half - 0.3 - gray_span), 2)
@@ -923,18 +983,16 @@ def randomize_scenario():
     gray_wall.position = (gray_wall_center_x, -half + 2.5, (GRAY_Z_MIN + GRAY_Z_MAX) / 2)
     gray_wall.scale = (0.1, 5, gray_span)
 
-    # ── Generar estaciones pegadas a paredes exteriores ──
     margin = 0.5
-    border = half - margin          # 2.0
+    border = half - margin
     step = 0.8
-    coords = [round(i * step, 2) for i in range(-2, 3)]   # [-1.6, -0.8, 0.0, 0.8, 1.6]
+    coords = [round(i * step, 2) for i in range(-2, 3)]
     candidates = []
     for c in coords:
-        candidates.append((c,  border))   # norte
-        candidates.append((c, -border))   # sur
-        candidates.append(( border, c))   # este
-        candidates.append((-border, c))   # oeste
-    # Hacer únicos
+        candidates.append((c, border))
+        candidates.append((c, -border))
+        candidates.append((border, c))
+        candidates.append((-border, c))
     seen = set()
     unique = []
     for cand in candidates:
@@ -944,9 +1002,8 @@ def randomize_scenario():
     candidates = unique
     random.shuffle(candidates)
 
-    # Filtrar candidatos que no choquen con la pared gris
     st_half = STATION_SCALE * 0.5
-    safe = st_half + 0.05 + 0.3       # ~0.7
+    safe = st_half + 0.05 + 0.3
     filtered = []
     for x, z in candidates:
         too_close = False
@@ -969,11 +1026,56 @@ def randomize_scenario():
             break
 
     if len(spots) < 6:
-        # Fallback fijo en bordes
         spots = [
-            ( 1.6,  border), (-0.8,  border), ( 0.8, -border),
-            (-1.6, -border), ( border, 0.8),  (-border, -0.8),
+            (1.6, border), (-0.8, border), (0.8, -border),
+            (-1.6, -border), (border, 0.8), (-border, -0.8),
         ]
+    return spots
+
+
+def randomize_scenario():
+    global pos_tomate, pos_lechuga, pos_corte, pos_ensamblaje, pos_platos, pos_entrega
+    global acc_tomate, acc_lechuga, acc_corte, acc_ensamblaje, acc_platos, acc_entrega
+    global NAV_GRID, DANGER_GRID, static_obstacles
+    global tiempo_restante, juego_activo, pedidos_completados, score
+    global cola_corte, cola_ensamblaje, cola_platos, plato_actual, all_ingredientes
+    global gray_wall_center_x, GRAY_Z_MIN, GRAY_Z_MAX
+
+    scenario = call_gemini_for_scenario()
+
+    if scenario and "stations" in scenario and "gray_wall" in scenario:
+        try:
+            gw = scenario["gray_wall"]
+            gray_wall_center_x = float(gw["center_x"])
+            GRAY_Z_MIN = float(gw["z_min"])
+            GRAY_Z_MAX = float(gw["z_max"])
+            gray_span = GRAY_Z_MAX - GRAY_Z_MIN
+            if gray_span < 0.5:
+                raise ValueError("gray_span too small")
+            gray_wall.position = (gray_wall_center_x, -half + 2.5, (GRAY_Z_MIN + GRAY_Z_MAX) / 2)
+            gray_wall.scale = (0.1, 5, gray_span)
+
+            name_map = {"tomate": None, "lechuga": None, "corte": None,
+                        "ensamblaje": None, "platos": None, "entrega": None}
+            for st in scenario["stations"]:
+                n = st["name"].lower().strip()
+                if n in name_map:
+                    name_map[n] = (float(st["x"]), float(st["z"]))
+
+            if None in name_map.values():
+                raise ValueError("Missing stations in Gemini response")
+
+            spots = [
+                name_map["tomate"], name_map["lechuga"], name_map["corte"],
+                name_map["ensamblaje"], name_map["platos"], name_map["entrega"]
+            ]
+            print("[Gemini] Escenario generado por IA")
+        except Exception as e:
+            print("[Gemini] Parse error:", e, "— usando random manual")
+            spots = _manual_randomize()
+    else:
+        print("[Gemini] Sin respuesta válida — usando random manual")
+        spots = _manual_randomize()
 
     def _set_station(st_entity, new_pos):
         st_entity.position = new_pos
