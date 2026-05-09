@@ -1,6 +1,7 @@
 from ursina import *
 from enum import Enum, auto
 import heapq
+from math import degrees, atan2
 
 app = Ursina()
 
@@ -29,6 +30,7 @@ TIEMPO_LIMITE = 90
 tiempo_restante = TIEMPO_LIMITE
 juego_activo    = True
 pedidos_completados = 0
+score = 0
 
 # ──────────────────────────────────────────────────────────────
 #  PATHFINDING A* + DANGER MAP (prefiere rutas alejadas de paredes)
@@ -345,6 +347,7 @@ gray_wall = Entity(model='cube', color=color.gray,
 def crear_ingrediente(pos, col, nombre):
     e = Entity(model='sphere', color=col, position=pos, scale=0.35, unlit=True)
     e.nombre = nombre
+    all_ingredientes.append(e)
     return e
 
 # ──────────────────────────────────────────────────────────────
@@ -382,6 +385,7 @@ cola_corte      = []
 cola_ensamblaje = []
 cola_platos     = []
 plato_actual    = []
+all_ingredientes = []
 
 # ──────────────────────────────────────────────────────────────
 #  CLASE BASE CON PATHFINDING
@@ -436,6 +440,11 @@ class BotBase:
         if dist > self.REACH:
             move = dir_vec.normalized() * self.SPEED * dt
             new_pos = self.e.position + move
+
+            # Rotación suave hacia la dirección de movimiento
+            target_rot = degrees(atan2(dir_vec.x, dir_vec.z))
+            diff = (target_rot - self.e.rotation_y + 180) % 360 - 180
+            self.e.rotation_y += diff * 10 * dt
 
             # Colisiones con obstáculos y paredes
             new_pos = push_out_of_obstacles(new_pos)
@@ -550,6 +559,14 @@ class Bot1(BotBase):
             self._destino_final = None
             self.set_destino(acc_tomate)
 
+    def get_status(self):
+        return {
+            EstadoBot1.IR_TOMATE:  "Recolectando tomate",
+            EstadoBot1.IR_CORTE_T: "Llevando tomate",
+            EstadoBot1.IR_LECHUGA: "Recolectando lechuga",
+            EstadoBot1.IR_CORTE_L: "Llevando lechuga",
+        }.get(self.estado, "Desconocido")
+
 
 # ──────────────────────────────────────────────────────────────
 #  BOT 2 – Cortador
@@ -632,6 +649,15 @@ class Bot2(BotBase):
             self.carga  = None
             self.estado = EstadoBot2.ESPERAR
 
+    def get_status(self):
+        return {
+            EstadoBot2.ESPERAR: "Esperando",
+            EstadoBot2.IR_IDLE: "Idle",
+            EstadoBot2.IR_CORTE: "Yendo a cortar",
+            EstadoBot2.CORTAR: "Cortando...",
+            EstadoBot2.IR_ENSAM: "Llevando a ensamblaje",
+        }.get(self.estado, "Desconocido")
+
 
 # ──────────────────────────────────────────────────────────────
 #  BOT 3 – Ensamblador
@@ -702,6 +728,14 @@ class Bot3(BotBase):
                 plato_actual.clear()
             self.estado = EstadoBot3.ESPERAR
 
+    def get_status(self):
+        return {
+            EstadoBot3.ESPERAR: "Esperando",
+            EstadoBot3.IR_IDLE: "Idle",
+            EstadoBot3.IR_ENSAM: "Yendo a ensamblaje",
+            EstadoBot3.IR_PLATO: "Llevando a platos",
+        }.get(self.estado, "Desconocido")
+
 
 # ──────────────────────────────────────────────────────────────
 #  BOT 4 – Repartidor
@@ -721,7 +755,7 @@ class Bot4(BotBase):
         self.cargas = []
 
     def update(self, dt):
-        global pedidos_completados
+        global pedidos_completados, score
         if not juego_activo:
             return
 
@@ -788,10 +822,20 @@ class Bot4(BotBase):
                 destroy(c)
             self.cargas = []
             pedidos_completados += 1
+            score += 150
             actualizar_contador()
+            actualizar_score()
             st_entrega.animate_scale(1.4, duration=0.15)
             st_entrega.animate_scale(1.0, duration=0.15, delay=0.15)
             self.estado = EstadoBot4.ESPERAR
+
+    def get_status(self):
+        return {
+            EstadoBot4.ESPERAR: "Esperando",
+            EstadoBot4.IR_IDLE: "Idle",
+            EstadoBot4.IR_PLATO: "Recogiendo plato",
+            EstadoBot4.IR_ENTREGA: "Entregando...",
+        }.get(self.estado, "Desconocido")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -809,7 +853,7 @@ window.color = color.dark_gray
 window.fps_counter.enabled = False
 window.exit_button.visible = False
 
-Text(text="CONTROLES: WASD / Flechas",
+Text(text="CONTROLES: WASD / Flechas  |  <red>R<default>: Nueva escena",
      position=(-0.75, 0.45), origin=(-0.5, 0.5),
      scale=1.1, background=True)
 
@@ -837,6 +881,17 @@ counter_text = Text(text="🍽 Pedidos: 0", position=(0, 0.36),
                     origin=(0, 0.5), scale=1.5,
                     background=True, color=color.lime)
 
+score_text = Text(text="⭐ Puntos: 0", position=(0, 0.30),
+                  origin=(0, 0.5), scale=1.5,
+                  background=True, color=color.gold)
+
+status_lines = []
+for i in range(4):
+    t = Text(text="", position=(-0.72, 0.35 - i*0.06),
+             origin=(-0.5, 0.5), scale=0.9,
+             background=True, color=color.white)
+    status_lines.append(t)
+
 fin_bg = Entity(model='quad', color=color.black66,
                 scale=(0.9, 0.35), position=(0, 0),
                 parent=camera.ui, enabled=False, z=-1)
@@ -846,6 +901,133 @@ fin_text = Text(text="", position=(0, 0), origin=(0, 0),
 
 def actualizar_contador():
     counter_text.text = f"🍽 Pedidos: {pedidos_completados}"
+
+def actualizar_score():
+    score_text.text = f"⭐ Puntos: {score}"
+
+def randomize_scenario():
+    global pos_tomate, pos_lechuga, pos_corte, pos_ensamblaje, pos_platos, pos_entrega
+    global acc_tomate, acc_lechuga, acc_corte, acc_ensamblaje, acc_platos, acc_entrega
+    global NAV_GRID, DANGER_GRID, static_obstacles
+    global tiempo_restante, juego_activo, pedidos_completados, score
+    global cola_corte, cola_ensamblaje, cola_platos, plato_actual, all_ingredientes
+
+    import random
+    margin = 0.8
+    gray_margin_x = 0.5
+    candidates = []
+    step = 0.8
+    xs = [round(i*step,2) for i in range(int(-2.2/step), int(2.2/step)+1)]
+    zs = [round(i*step,2) for i in range(int(-2.2/step), int(2.2/step)+1)]
+    for x in xs:
+        for z in zs:
+            if abs(x) < gray_margin_x and -2.5 <= z <= 0.5:
+                continue
+            if abs(x) > half - margin or abs(z) > half - margin:
+                continue
+            candidates.append((x, z))
+    random.shuffle(candidates)
+
+    spots = []
+    for cand in candidates:
+        ok = True
+        for s in spots:
+            if ((cand[0]-s[0])**2 + (cand[1]-s[1])**2)**0.5 < 1.0:
+                ok = False
+                break
+        if ok:
+            spots.append(cand)
+        if len(spots) >= 6:
+            break
+    if len(spots) < 6:
+        spots = [
+            ( 1.0, -2.0), ( 2.0, -2.0), (-2.0, -2.0),
+            (-2.0, -1.0), (-2.0,  0.0), ( 2.0,  1.0),
+        ]
+
+    def _set_station(st_entity, new_pos):
+        st_entity.position = new_pos
+        return new_pos
+
+    pos_tomate     = _set_station(st_tomate,     Vec3(spots[0][0], STATION_Y, spots[0][1]))
+    pos_lechuga    = _set_station(st_lechuga,    Vec3(spots[1][0], STATION_Y, spots[1][1]))
+    pos_corte      = _set_station(st_corte,      Vec3(spots[2][0], STATION_Y, spots[2][1]))
+    pos_ensamblaje = _set_station(st_ensamblaje, Vec3(spots[3][0], STATION_Y, spots[3][1]))
+    pos_platos     = _set_station(st_platos,     Vec3(spots[4][0], STATION_Y, spots[4][1]))
+    pos_entrega    = _set_station(st_entrega,    Vec3(spots[5][0], STATION_Y, spots[5][1]))
+
+    station_positions = [pos_tomate, pos_lechuga, pos_corte, pos_ensamblaje, pos_platos, pos_entrega]
+    NAV_GRID, DANGER_GRID = _build_grids(station_positions)
+
+    static_obstacles.clear()
+    for sp in station_positions:
+        register_obstacle(sp)
+
+    def _compute_access(station_pos):
+        to_center = Vec3(0, _BOT_Y, 0) - station_pos
+        to_center.y = 0
+        if to_center.length() < 0.1:
+            to_center = Vec3(0, 0, 1)
+        to_center = to_center.normalized()
+        acc = station_pos + to_center * 0.7
+        return Vec3(acc.x, _BOT_Y, acc.z)
+
+    acc_tomate     = _compute_access(pos_tomate)
+    acc_lechuga    = _compute_access(pos_lechuga)
+    acc_corte      = _compute_access(pos_corte)
+    acc_ensamblaje = _compute_access(pos_ensamblaje)
+    acc_platos     = _compute_access(pos_platos)
+    acc_entrega    = _compute_access(pos_entrega)
+
+    tiempo_restante = TIEMPO_LIMITE
+    juego_activo = True
+    pedidos_completados = 0
+    score = 0
+    timer_text.color = color.yellow
+    fin_bg.enabled = False
+    fin_text.enabled = False
+
+    cola_corte.clear()
+    cola_ensamblaje.clear()
+    cola_platos.clear()
+    plato_actual.clear()
+
+    for bot in all_bots:
+        bot.waypoints.clear()
+        bot._destino_final = None
+        bot._last_pos = None
+        bot._stuck_t = 0.0
+        if hasattr(bot, 'carga') and bot.carga:
+            bot.carga = None
+        if hasattr(bot, 'cargas'):
+            bot.cargas.clear()
+        if hasattr(bot, 'timer'):
+            bot.timer = 0.0
+
+    for ing in all_ingredientes:
+        if ing:
+            destroy(ing)
+    all_ingredientes.clear()
+
+    bot1.e.position = Vec3(0, _BOT_Y, 2)
+    bot1.e.rotation_y = 0
+    bot1.estado = EstadoBot1.IR_TOMATE
+    bot1.set_destino(acc_tomate)
+
+    bot2.e.position = Vec3(0, _BOT_Y, 1.5)
+    bot2.e.rotation_y = 0
+    bot2.estado = EstadoBot2.ESPERAR
+
+    bot3.e.position = Vec3(1, _BOT_Y, 0)
+    bot3.e.rotation_y = 0
+    bot3.estado = EstadoBot3.ESPERAR
+
+    bot4.e.position = Vec3(-1, _BOT_Y, 1)
+    bot4.e.rotation_y = 0
+    bot4.estado = EstadoBot4.ESPERAR
+
+    actualizar_contador()
+    actualizar_score()
 
 def mostrar_fin():
     fin_bg.enabled   = True
@@ -865,8 +1047,10 @@ pivot.rotation_x, pivot.rotation_y = 35, 45
 # ──────────────────────────────────────────────────────────────
 #  UPDATE PRINCIPAL
 # ──────────────────────────────────────────────────────────────
+_r_pressed = False
+
 def update():
-    global tiempo_restante, juego_activo
+    global tiempo_restante, juego_activo, _r_pressed
 
     dt = time.dt
 
@@ -892,6 +1076,18 @@ def update():
     bot2.update(dt)
     bot3.update(dt)
     bot4.update(dt)
+
+    if held_keys['r']:
+        if not _r_pressed:
+            _r_pressed = True
+            randomize_scenario()
+    else:
+        _r_pressed = False
+
+    status_lines[0].text = f"<orange>B1<default>: {bot1.get_status()}"
+    status_lines[1].text = f"<magenta>B2<default>: {bot2.get_status()}"
+    status_lines[2].text = f"<cyan>B3<default>: {bot3.get_status()}"
+    status_lines[3].text = f"<violet>B4<default>: {bot4.get_status()}"
 
     rot_speed = 100 * dt
     pivot.rotation_y += (held_keys['d'] - held_keys['a'] +
