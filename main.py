@@ -1,10 +1,10 @@
 """
 RoboKitchen — MLH Hackathon 2026 | RoBorregos | Tec de Monterrey
 Overcooked 3D: 4 robots pipeline preparando ensaladas.
-Ursina (visual) + PyBullet (fisica) + Gemini (IA estrategica).
+Ursina (visual) + PyBullet (fisica) + Gemini (randomizador de escenarios).
 """
 
-import threading, time, json, sys
+import threading, time, json, sys, random, math
 
 # ── Dependencias ─────────────────────────────────────────────────────────────
 try:
@@ -42,11 +42,12 @@ ROBOT_COLORS  = {
 }
 ROBOT_Y = FLOOR_Y + 0.35
 ROBOT_STARTS  = [
-    Vec3(2.0,  ROBOT_Y, 2.2),   # recolector  — lejos almacen
-    Vec3(0.7,  ROBOT_Y, 2.2),   # cortador    — lejos corte
-    Vec3(-0.7, ROBOT_Y, 2.2),   # ensamblador — lejos ensamblaje/platos
-    Vec3(-2.0, ROBOT_Y, 2.2),   # repartidor  — lejos entrega
+    Vec3(2.0,  ROBOT_Y, 2.2),
+    Vec3(0.7,  ROBOT_Y, 2.2),
+    Vec3(-0.7, ROBOT_Y, 2.2),
+    Vec3(-2.0, ROBOT_Y, 2.2),
 ]
+# STATIONS es mutable — Scenario lo actualiza
 STATIONS = {
     "almacen_tomate":  Vec3(1.0, OBJ_Y, -2.0),
     "almacen_lechuga": Vec3(2.0, OBJ_Y, -2.0),
@@ -55,6 +56,7 @@ STATIONS = {
     "platos":          Vec3(-2.0, OBJ_Y, 0.0),
     "entrega":         Vec3(2.0, OBJ_Y, 1.0),
 }
+STATION_DEFAULTS = dict(STATIONS)
 INGREDIENT_COLORS = {
     "lechuga": {"crudo": color.rgb(60, 190, 60), "cortado": color.rgb(30, 240, 30),
                 "plato": color.rgb(255, 210, 60)},
@@ -135,27 +137,55 @@ class Robot:
         self.pw = pw; self.rid = rid; self.role = role
         self.start = start; self.action = "idle"; self.carrying = None
         self.carrying_plate = None; self.station = "pasillo"
-        self.body = pw.box((0.4, 0.35, 0.5), 3.0, (start.x, start.y, start.z),
+        # Cuerpo físico
+        self.body = pw.box((0.35, 0.35, 0.45), 3.0, (start.x, start.y, start.z),
                            ldamp=0.5, adamp=0.9)
+        # Visual principal
         self.vis = Entity(model="cube", color=ROBOT_COLORS[role],
-                          scale=(0.8, 0.7, 1.0), position=start,
+                          scale=(0.7, 0.7, 0.9), position=start,
                           unlit=True, edge_color=color.black, edge_width=2)
-        self.dot = Entity(parent=self.vis, model="quad", color=color.yellow,
-                          scale=(0.3, 0.3), position=Vec3(0, 0.9, 0),
+        # Ruedas (4 cubos pequeños)
+        wcol = color.rgb(40,40,40)
+        self.wheels = []
+        for wx, wz in [(-0.25,-0.3),(0.25,-0.3),(-0.25,0.3),(0.25,0.3)]:
+            w = Entity(parent=self.vis, model="cube", color=wcol, scale=(0.15,0.1,0.15),
+                       position=Vec3(wx, -0.45, wz))
+            self.wheels.append(w)
+        # "Brazo" / indicador
+        self.arm = Entity(parent=self.vis, model="cube", color=color.orange,
+                          scale=(0.1, 0.4, 0.1), position=Vec3(0, 0.55, 0.3))
+        # Dot de carga
+        self.dot = Entity(parent=self.vis, model="sphere", color=color.yellow,
+                          scale=0.15, position=Vec3(0, 0.9, 0),
                           billboard=True, enabled=False)
+        # Timer para pathfinding evasión
+        self._avoid_t = 0.0
+        self._avoid_dir = 1
 
     def pos(self): p = self.pw.pos(self.body); return Vec3(p[0], p[1], p[2])
 
     def sync(self):
         p = self.pw.pos(self.body); self.vis.position = Vec3(p[0], p[1], p[2])
+        # Girar hacia la dirección de movimiento
+        v = self.pw.vel(self.body)
+        if abs(v[0]) > 0.1 or abs(v[2]) > 0.1:
+            angle = math.degrees(math.atan2(v[0], v[2]))
+            self.vis.rotation_y = angle
         self.dot.enabled = self.carrying is not None or self.carrying_plate is not None
 
     def move_to(self, target):
         pp = self.pos(); dx = target.x - pp.x; dz = target.z - pp.z
         d = (dx*dx + dz*dz)**0.5
-        if d < 0.4: self.stop(); return
+        if d < 0.5: self.stop(); return
         f = ROBOT_FORCES[self.role]
-        self.pw.force(self.body, (dx/d*f, 0, dz/d*f))
+        # Si estamos en modo evasión, desviar
+        if self._avoid_t > 0:
+            self._avoid_t -= utime.dt
+            perp_x = -dz/d * self._avoid_dir
+            perp_z = dx/d * self._avoid_dir
+            self.pw.force(self.body, ((dx/d*0.5 + perp_x*0.5)*f, 0, (dz/d*0.5 + perp_z*0.5)*f))
+        else:
+            self.pw.force(self.body, (dx/d*f, 0, dz/d*f))
         self._clamp()
 
     def stop(self): self.pw.reset(self.body, (self.pos().x, self.pos().y, self.pos().z))
@@ -167,6 +197,11 @@ class Robot:
             f = mx/s
             p.resetBaseVelocity(self.body, linearVelocity=(v[0]*f, v[1], v[2]*f),
                                 angularVelocity=(0,0,0), physicsClientId=self.pw.cli)
+
+    def avoid(self):
+        """Llamar cuando detecta obstáculo — gira momentáneamente"""
+        self._avoid_t = 0.5
+        self._avoid_dir = random.choice([-1, 1])
 
     def pickup(self, ing):
         self.carrying = ing; ing.held = self; self.action = "carrying"
@@ -187,6 +222,7 @@ class Robot:
             self.carrying_plate.vis.parent = None
             self.carrying_plate.held = None; self.carrying_plate = None
         self.action = "idle"; self.station = "pasillo"
+        self._avoid_t = 0.0
         self.pw.reset(self.body, (self.start.x, self.start.y, self.start.z))
         self.vis.position = self.start
 
@@ -224,60 +260,73 @@ class Ingredient:
         self.vis.position = self.spawn + Vec3(0, 0.3, 0)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GEMINI AGENT
+#  GEMINI AGENT — Scenario Architect
 # ══════════════════════════════════════════════════════════════════════════════
 
 class GeminiAgent:
     SYS = (
-        "Eres el chef de RoboKitchen: 4 robots hacen ensaladas en cadena.\n"
-        "ROBOTS: 0=RECOLECTOR(rapido),1=CORTADOR(medio),2=ENSAMBLADOR(medio),3=REPARTIDOR(rapido).\n"
-        "PIPELINE: ALMACEN(x>0,z=-2)->RECOGER->CORTE(-2,-2)->CORTAR 2s->ENSAMBLAJE(-2,-1)->ARMAR->PLATO->ENTREGA(2,1).\n"
-        "PLATOS(-2,0) = donde ENSAMBLADOR recoge plato vacio para llevar a ENSAMBLAJE.\n"
-        "PARED en x=0 de z=-2.5 a z=0. Rodear por z>0.\n"
-        "RESPONDE SOLO JSON array: [{\"robot_id\":0,\"action\":\"pickup\",\"target\":[x,z]}, ...]\n"
-        "Acciones: pickup, deliver, process, assemble, pickup_plate, goto, wait, idle"
+        "Eres un arquitecto de cocina robotica. Genera escenarios variados para RoboKitchen.\n"
+        "Responde SOLO con este JSON exacto:\n"
+        "{\n"
+        '  "stations": {\n'
+        '    "almacen_tomate":  [x, z],\n'
+        '    "almacen_lechuga": [x, z],\n'
+        '    "corte":           [x, z],\n'
+        '    "ensamblaje":      [x, z],\n'
+        '    "platos":          [x, z],\n'
+        '    "entrega":         [x, z]\n'
+        "  },\n"
+        '  "obstacles": [\n'
+        '    {"x": num, "z": num, "scale": [w, h, d]}, ...\n'
+        "  ]\n"
+        "}\n"
+        "Reglas:\n"
+        "- x entre -2 y 2, z entre -2 y 2.\n"
+        "- almacenes: x > 0 (zona derecha).\n"
+        "- corte/ensamblaje/platos: x < 0 (zona izquierda).\n"
+        "- entrega: x > 0, z > 0.\n"
+        "- 2-4 obstaculos, scale entre [0.3,0.3,0.3] y [1.0,0.3,1.0].\n"
+        "- Deja pasillo central libre (z>0 o z<0)."
     )
-    PROJECT = "neural-pattern-495817-k4"
-    LOCATION = "us-central1"
     MODEL = "gemini-2.0-flash"
 
     def __init__(self):
         import os
+        from dotenv import load_dotenv
+        load_dotenv()
         from google import genai
-        from google.genai import types
-        self._genai = genai
-        self._types = types
-        os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "true")
-        os.environ.setdefault("GOOGLE_CLOUD_PROJECT", self.PROJECT)
-        os.environ.setdefault("GOOGLE_CLOUD_LOCATION", self.LOCATION)
-        self.calls = 0; self._err_shown = False; self._ok = False
+        key = os.getenv("GEMINI_API_KEY")
+        if not key:
+            print("[Gemini] GEMINI_API_KEY no en .env — scenario manual activo")
+            self._ok = False; self.client = None; return
         try:
-            self.client = genai.Client(vertexai=True, project=self.PROJECT, location=self.LOCATION)
+            self.client = genai.Client(api_key=key)
             test = self.client.models.generate_content(
                 model=self.MODEL,
-                contents="Responde solo: OK",
-                config=types.GenerateContentConfig(temperature=0, max_output_tokens=10))
+                contents="Responde: OK",
+                config=genai.types.GenerateContentConfig(temperature=0, max_output_tokens=10))
             if "OK" in (test.text or "").upper():
-                self._ok = True; print("[Gemini] Vertex AI OK — listo para usar")
+                self._ok = True; print("[Gemini] API OK — scenario architect listo")
             else:
-                print("[Gemini] Vertex respondio pero sin OK — fallback manual activo")
+                self._ok = False; print("[Gemini] API respondio pero sin OK")
         except Exception as e:
-            print(f"[Gemini] Vertex NO disponible ({type(e).__name__}) — fallback manual activo")
+            self._ok = False
+            print(f"[Gemini] API NO disponible ({type(e).__name__}) — scenario manual activo")
 
-    def decide(self, state):
-        self.calls += 1
-        prompt = f"{self.SYS}\n=== #{self.calls} ===\n{json.dumps(state,indent=2)}\n\nJSON array:"
+    def generate_scenario(self):
+        if not self._ok or not self.client:
+            return self._default_scenario()
+        prompt = self.SYS + "\n\nGenera escenario aleatorio:"
         try:
             r = self.client.models.generate_content(
                 model=self.MODEL,
                 contents=prompt,
-                config=self._types.GenerateContentConfig(temperature=0.2, max_output_tokens=300))
-            return self._parse(r.text)
+                config=genai.types.GenerateContentConfig(temperature=0.9, max_output_tokens=400))
+            data = self._parse(r.text)
+            if data: return data
         except Exception as e:
-            if not self._err_shown:
-                print(f"[Gemini] Error Vertex ({type(e).__name__}) — usando pipeline manual")
-                self._err_shown = True
-            return self._fallback(state)
+            print(f"[Gemini] Error generando escenario: {type(e).__name__}")
+        return self._default_scenario()
 
     def _parse(self, t):
         t = (t or "").strip()
@@ -285,47 +334,104 @@ class GeminiAgent:
             p = t.split("```"); t = p[1] if len(p)>=2 else t
             if t.startswith("json"): t = t[4:]
         t = t.strip()
-        try: d = json.loads(t)
+        try:
+            d = json.loads(t)
+            if "stations" in d and "obstacles" in d:
+                return d
         except:
-            import re; m = re.search(r"\[.*\]", t, re.DOTALL)
-            if m: d = json.loads(m.group())
-            else: return []
-        return [{"robot_id":int(c.get("robot_id",0)),"action":c.get("action","idle"),
-                 "target":c.get("target"), "station":c.get("station",c.get("target"))}
-                for c in d if isinstance(c,dict)]
+            import re; m = re.search(r"\{.*\}", t, re.DOTALL)
+            if m:
+                try:
+                    d = json.loads(m.group())
+                    if "stations" in d and "obstacles" in d:
+                        return d
+                except: pass
+        return None
 
-    def _fallback(self, s):
-        rs = {r["id"]:r for r in s.get("robots",[])}; pending = s.get("orders",{}).get("pending",0)
-        if pending <= 0: return [{"robot_id":i,"action":"idle"} for i in range(4)]
-        cmds = []
-        r0 = rs.get(0,{}); r1 = rs.get(1,{}); r2 = rs.get(2,{}); r3 = rs.get(3,{})
-        ings = s.get("ingredients",[])
-        crudos = [i for i in ings if i.get("state")=="crudo" and not i.get("held_by")]
-        cortados = [i for i in ings if i.get("state")=="cortado" and not i.get("held_by")]
-        # 0 recolector
-        if crudos and not r0.get("carrying"):
-            cmds.append({"robot_id":0,"action":"pickup","target":crudos[0]["pos"]})
-        elif r0.get("carrying"):
-            cmds.append({"robot_id":0,"action":"deliver","target":"corte"})
-        else: cmds.append({"robot_id":0,"action":"idle"})
-        # 1 cortador
-        if r1.get("carrying"):
-            cmds.append({"robot_id":1,"action":"process"})
-        else:
-            cmds.append({"robot_id":1,"action":"goto","target":"corte"})
-        # 2 ensamblador
-        if not r2.get("carrying_plate") and not r2.get("carrying"):
-            cmds.append({"robot_id":2,"action":"pickup_plate","target":"platos"})
-        elif r2.get("carrying_plate") and cortados:
-            cmds.append({"robot_id":2,"action":"assemble","target":"ensamblaje"})
-        else: cmds.append({"robot_id":2,"action":"idle"})
-        # 3 repartidor
-        if not r3.get("carrying_plate") and not r3.get("carrying"):
-            cmds.append({"robot_id":3,"action":"goto","target":"ensamblaje"})
-        elif r3.get("carrying_plate"):
-            cmds.append({"robot_id":3,"action":"deliver","target":"entrega"})
-        else: cmds.append({"robot_id":3,"action":"idle"})
-        return cmds
+    def _default_scenario(self):
+        return {
+            "stations": {
+                "almacen_tomate":  [1.0, -2.0],
+                "almacen_lechuga": [2.0, -2.0],
+                "corte":           [-2.0, -2.0],
+                "ensamblaje":      [-2.0, -1.0],
+                "platos":          [-2.0, 0.0],
+                "entrega":         [2.0, 1.0],
+            },
+            "obstacles": [
+                {"x": 0.0, "z": 1.5, "scale": [0.6, 0.3, 0.6]},
+                {"x": -1.0, "z": 1.5, "scale": [0.6, 0.3, 0.6]},
+            ]
+        }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCENARIO — aplica escenarios al mundo
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Scenario:
+    def __init__(self, pw):
+        self.pw = pw
+        self.vis_refs = {}   # {"corte": Entity, ...}
+        self.text_refs = {}  # {"corte": Text, ...}
+        self.body_refs = {}  # {"corte": pybullet_id, ...}
+        self.obstacle_vis = []  # lista de Entity
+        self.obstacle_body = [] # lista de pybullet_id
+        self._current = GeminiAgent()._default_scenario()
+
+    def set_refs(self, vis, texts, bodies):
+        self.vis_refs = vis
+        self.text_refs = texts
+        self.body_refs = bodies
+
+    def apply(self, config):
+        self._current = config
+        # Actualizar STATIONS global
+        for k, v in config.get("stations", {}).items():
+            STATIONS[k] = Vec3(v[0], OBJ_Y, v[1])
+            # Mover visual
+            if k in self.vis_refs:
+                self.vis_refs[k].position = Vec3(v[0], OBJ_Y, v[1])
+            if k in self.text_refs:
+                self.text_refs[k].position = Vec3(v[0], OBJ_Y + 0.9, v[1])
+            if k in self.body_refs:
+                self.pw.reset(self.body_refs[k], (v[0], OBJ_Y, v[1]))
+        # Actualizar ingredientes spawn
+        for ing in ingredients:
+            st_key = "almacen_lechuga" if ing.itype == "lechuga" else "almacen_tomate"
+            if st_key in STATIONS:
+                ing.spawn = STATIONS[st_key]
+                ing.reset()
+        # Actualizar plato spawn
+        for pl in plates:
+            pl.spawn = STATIONS["platos"]
+            pl.reset()
+        # Limpiar y crear obstáculos
+        self._clear_obstacles()
+        for obs in config.get("obstacles", []):
+            pos = (obs["x"], OBJ_Y, obs["z"])
+            scl = obs.get("scale", [0.5, 0.3, 0.5])
+            half = [s/2 for s in scl]
+            # Visual
+            vis = Entity(model="cube", color=color.gray,
+                         position=Vec3(pos[0], pos[1], pos[2]),
+                         scale=tuple(scl),
+                         unlit=True, edge_color=color.black, edge_width=2)
+            self.obstacle_vis.append(vis)
+            # Física
+            body = self.pw.box(half, 0, pos)
+            self.obstacle_body.append(body)
+
+    def _clear_obstacles(self):
+        for v in self.obstacle_vis:
+            if hasattr(v, 'enabled'): v.enabled = False
+            if hasattr(v, 'parent') and v.parent: v.parent = None
+        for b in self.obstacle_body:
+            p.removeBody(b, physicsClientId=self.pw.cli)
+        self.obstacle_vis.clear()
+        self.obstacle_body.clear()
+
+    def reset_default(self):
+        self.apply(GeminiAgent()._default_scenario())
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ORDER MANAGER
@@ -373,19 +479,28 @@ Entity(model="cube", color=color.gray,
        position=(0,0,-1.25), scale=(0.1,WALL_H,WALL_H/2),
        unlit=True, edge_color=color.black, edge_width=2)
 
-stations_data = [
-    ((1,OBJ_Y,-2),  color.red,    "TOMATE"),
-    ((2,OBJ_Y,-2),  color.green,  "LECHUGA"),
-    ((-2,OBJ_Y,-2), color.yellow, "CORTE"),
-    ((-2,OBJ_Y,-1), color.brown,  "ENSAMBLE"),
-    ((-2,OBJ_Y,0),  color.white,  "PLATOS"),
-    ((2,OBJ_Y,1),   color.azure,  "ENTREGA"),
-]
-for pos, clr, lbl in stations_data:
-    Entity(model="cube", color=clr, position=pos, scale=1,
-           unlit=True, edge_color=color.black, edge_width=3)
-    Text(text=lbl, position=(pos[0], pos[1]+0.9, pos[2]),
-         origin=(0,0), scale=0.8, color=color.white, billboard=True)
+# ── Estaciones (guardar referencias para Scenario) ───────────────────────────
+stations_vis = {}
+stations_text = {}
+stations_body = {}
+
+def _make_station(name, pos, clr):
+    e = Entity(model="cube", color=clr, position=pos, scale=1,
+               unlit=True, edge_color=color.black, edge_width=3)
+    t = Text(text=name.upper(), position=(pos[0], pos[1]+0.9, pos[2]),
+             origin=(0,0), scale=0.8, color=color.white, billboard=True)
+    b = pw.box((0.5, 0.5, 0.5), 0, (pos[0], pos[1], pos[2]))
+    stations_vis[name] = e
+    stations_text[name] = t
+    stations_body[name] = b
+    return e, t, b
+
+_make_station("almacen_tomate",  STATIONS["almacen_tomate"],  color.red)
+_make_station("almacen_lechuga", STATIONS["almacen_lechuga"], color.green)
+_make_station("corte",           STATIONS["corte"],           color.yellow)
+_make_station("ensamblaje",      STATIONS["ensamblaje"],      color.brown)
+_make_station("platos",          STATIONS["platos"],          color.white)
+_make_station("entrega",         STATIONS["entrega"],         color.azure)
 
 Text(text=("<red>Rojo:<default> Tomate\n<green>Verde:<default> Lechuga\n"
            "<yellow>Amarillo:<default> Corte\n<brown>Cafe:<default> Ensamble\n"
@@ -402,23 +517,19 @@ pivot.rotation_x, pivot.rotation_y = 35, 45
 
 # ── Física ───────────────────────────────────────────────────────────────────
 pw = PhysicsWorld()
-hw = WALL_H/2  # 2.5
+hw = WALL_H/2
 
-# Piso físico en y = -2.5 (misma altura que el quad visual)
+# Piso físico
 pw.box((ARENA_HALF + 0.5, 0.1, ARENA_HALF + 0.5), 0, (0, FLOOR_Y - 0.1, 0))
 
-# Paredes perimetrales (física alineada con visual: centro y=0, altura 5)
+# Paredes perimetrales
 for wx, wz in [(ARENA_HALF + 0.15, 0), (-(ARENA_HALF + 0.15), 0),
                (0, ARENA_HALF + 0.15), (0, -(ARENA_HALF + 0.15))]:
     hx, hz = (0.15, ARENA_HALF + 0.15) if wx == 0 else (ARENA_HALF + 0.15, 0.15)
     pw.box((hx, hw, hz), 0, (wx, 0, wz))
 
-# Pared interna (física alineada con visual: centro y=0)
+# Pared interna
 pw.box((0.05, hw, 1.25), 0, (0, 0, -1.25))
-
-# Colisiones estaciones (para que robots no atraviesen los cubos)
-for pos, _, _ in stations_data:
-    pw.box((0.5, 0.5, 0.5), 0, (pos[0], pos[1], pos[2]))
 
 # ── Robots ───────────────────────────────────────────────────────────────────
 roles = ["recolector","cortador","ensamblador","repartidor"]
@@ -466,17 +577,16 @@ class Plate:
 
 plates = [Plate(pw, STATIONS["platos"])]
 
-# ── Órdenes + Gemini ─────────────────────────────────────────────────────────
+# ── Scenario ─────────────────────────────────────────────────────────────────
+scenario = Scenario(pw)
+scenario.set_refs(stations_vis, stations_text, stations_body)
+
+# ── Gemini ───────────────────────────────────────────────────────────────────
+gemini = GeminiAgent()
+
+# ── Órdenes ──────────────────────────────────────────────────────────────────
 orders = OrderManager()
 orders.spawn()
-
-gemini_on = True
-try: gemini = GeminiAgent()
-except Exception as e: print(f"[Gemini] Off: {e}"); gemini_on = False; gemini = None
-
-_glock = threading.Lock()
-_cmds = []
-_last_g = 0.0
 
 # ── HUD robots ───────────────────────────────────────────────────────────────
 robot_ui = []
@@ -485,8 +595,9 @@ for i, rl in enumerate(roles):
              origin=(-0.5,0.5), scale=0.8); robot_ui.append(t)
 score_txt = Text(text="SCORE: 0 | PEDIDOS: 1", position=(-0.75, 0.22),
                  origin=(-0.5,0.5), scale=0.9, color=color.yellow)
-gemini_txt = Text(text="Gemini: ON", position=(-0.75, 0.16),
-                  origin=(-0.5,0.5), scale=0.8, color=color.green)
+gemini_txt = Text(text="Gemini: ON" if gemini._ok else "Gemini: OFF",
+                  position=(-0.75, 0.16), origin=(-0.5,0.5), scale=0.8,
+                  color=color.green if gemini._ok else color.red)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS (game loop)
@@ -500,37 +611,20 @@ def _clamp_speed(r):
         p.resetBaseVelocity(r.body, linearVelocity=(v[0]*f,v[1],v[2]*f),
                             angularVelocity=(0,0,0), physicsClientId=pw.cli)
 
-def _resolve_target(tgt, stn):
-    if isinstance(tgt, (list,tuple)) and len(tgt)>=2:
-        return Vec3(tgt[0], OBJ_Y, tgt[-1])
-    if isinstance(tgt, str):
-        st = STATIONS.get(tgt) or STATIONS.get(stn)
-        return st
-    return None
-
 def _update_stations():
     for r in robots:
         pp = r.pos()
-        if abs(pp.x-(-2.0))<0.7 and abs(pp.z-(-2.0))<0.7: r.station = "corte"
-        elif abs(pp.x-(-2.0))<0.7 and abs(pp.z-(-1.0))<0.7: r.station = "ensamblaje"
-        elif abs(pp.x-2.0)<0.7 and abs(pp.z-1.0)<0.7: r.station = "entrega"
-        elif abs(pp.x-(-2.0))<0.7 and abs(pp.z-0.0)<0.7: r.station = "platos"
-        elif pp.x>0 and pp.z<-1.0: r.station = "almacen"
-        else: r.station = "pasillo"
-
-def _state():
-    rs = []
-    for r in robots:
-        pp = r.pos()
-        rs.append({"id":r.rid,"role":r.role,"pos":[round(pp.x,2),round(pp.z,2)],
-                   "carrying":r.carrying.itype if r.carrying else None,
-                   "station":r.station,"action":r.action})
-    igs = []
-    for i in ingredients:
-        pp = i.pos()
-        igs.append({"type":i.itype,"state":i.state,"pos":[round(pp.x,2),round(pp.z,2)],
-                    "held_by":i.held.rid if i.held else None})
-    return {"orders":orders.st(),"robots":rs,"ingredients":igs,"score":orders.score}
+        found = False
+        for name, pos in STATIONS.items():
+            if abs(pp.x - pos.x) < 0.7 and abs(pp.z - pos.z) < 0.7:
+                r.station = name
+                found = True
+                break
+        if not found:
+            if pp.x > 0 and pp.z < -1.0:
+                r.station = "almacen"
+            else:
+                r.station = "pasillo"
 
 def _navigate(r, tgt):
     pp = r.pos(); dx = tgt.x-pp.x; dz = tgt.z-pp.z
@@ -546,62 +640,51 @@ def _try_pickup(r):
         if (r.pos()-ing.pos()).length() < 1.5:
             r.pickup(ing); return
 
-def _apply_cmds():
-    global _cmds
-    with _glock: cmds = _cmds.copy(); _cmds.clear()
-    now = time.time()
-    for c in cmds:
-        rid = c.get("robot_id",0); act = c.get("action","idle")
-        tgt = c.get("target"); stn = c.get("station",tgt)
-        if rid >= len(robots): continue
-        r = robots[rid]; r.action = act; r._last_cmd_t = now
-        if act in ("goto","pickup","deliver"):
-            tp = _resolve_target(tgt, stn)
-            if tp is None: r.stop(); continue
-            _navigate(r, tp)
-            if act == "pickup":
-                if r.role == "ensamblador" and r.station == "platos":
-                    _try_pickup_plate(r)
-                elif r.station in ("almacen","corte"):
-                    _try_pickup(r)
-            elif act == "deliver" and (r.pos()-tp).length() < 1.0:
-                if r.carrying: r.drop(r.pos())
-        elif act == "process" and r.station == "corte" and r.carrying:
-            if not r.carrying.proc:
-                r.carrying.proc = True; r.carrying.proc_t = 2.0
-        elif act == "assemble" and r.station == "ensamblaje":
-            cort = [i for i in ingredients if i.state=="cortado" and not i.held]
-            lech = [i for i in cort if i.itype=="lechuga"]
-            tom = [i for i in cort if i.itype=="tomate"]
-            if lech and tom and r.carrying_plate and not r.carrying_plate.food:
-                r.carrying_plate.food = True
-                r.carrying_plate.vis.color = color.rgb(255, 210, 60)
-                lech[0].reset(); tom[0].reset()
-                r.carrying_plate.drop(r.pos())
-        elif act == "pickup_plate" and r.station in ("platos","ensamblaje"):
-            _try_pickup_plate(r)
-        else: r.stop()
-
 def _try_pickup_plate(r):
     for p in plates:
         if p.held or p.food: continue
         if (r.pos()-p.pos()).length() < 1.5:
             p.pickup(r); return
 
+def _check_obstacles(r):
+    """Pathfinding evasión simple: detecta colisiones cercanas y evade"""
+    pp = r.pos()
+    # Raycast simple: proyectar puntos adelante
+    v = pw.vel(r.body)
+    speed = (v[0]**2 + v[2]**2)**0.5
+    if speed < 0.5: return
+    # Normalizar velocidad
+    vx, vz = v[0]/speed, v[2]/speed
+    # Proyectar 3 posiciones adelante (centro, izq, der)
+    for dist in [0.8, 1.2]:
+        cx = pp.x + vx * dist
+        cz = pp.z + vz * dist
+        # Verificar si hay obstáculo cerca en PyBullet
+        # Hacemos un overlap test con aabb simple
+        for obs_body in scenario.obstacle_body:
+            op = pw.pos(obs_body)
+            if abs(op[0] - cx) < 0.4 and abs(op[2] - cz) < 0.4:
+                r.avoid()
+                return
+        # También verificar otras estaciones (que ya tienen cuerpos)
+        for name, body in stations_body.items():
+            if name in ("platos","entrega"): continue
+            op = pw.pos(body)
+            if abs(op[0] - cx) < 0.5 and abs(op[2] - cz) < 0.5:
+                r.avoid()
+                return
+
 def _pipeline():
-    now = time.time()
     ensamblador = robots[2]
     repartidor = robots[3]
 
     for r in robots:
-        # skip if Gemini gave a command recently (<1s)
-        if getattr(r, "_last_cmd_t", 0) and now - r._last_cmd_t < 1.0:
-            continue
+        _check_obstacles(r)
         if r.role == "recolector" and not r.carrying:
             crudos = [i for i in ingredients if i.state=="crudo" and not i.held]
             if crudos and orders.pending > 0:
                 _navigate(r, crudos[0].spawn)
-                if r.station == "almacen": _try_pickup(r)
+                if r.station in ("almacen_tomate","almacen_lechuga","almacen"): _try_pickup(r)
         if r.role == "cortador" and not r.carrying:
             _navigate(r, STATIONS["corte"])
             if r.station == "corte":
@@ -609,43 +692,42 @@ def _pipeline():
                     if not ing.held and ing.state == "crudo":
                         if (r.pos()-ing.pos()).length() < 1.5: r.pickup(ing)
 
-    if not (getattr(ensamblador, "_last_cmd_t", 0) and now - ensamblador._last_cmd_t < 1.0):
-        if ensamblador.carrying_plate and ensamblador.carrying_plate.food:
-            if ensamblador.station == "ensamblaje":
-                ensamblador.carrying_plate.drop(ensamblador.pos())
-            else:
-                _navigate(ensamblador, STATIONS["ensamblaje"])
-        elif not ensamblador.carrying_plate:
-            free_plates = [p for p in plates if not p.held and not p.food]
-            if free_plates:
-                _navigate(ensamblador, STATIONS["platos"])
-                if ensamblador.station == "platos": _try_pickup_plate(ensamblador)
-            elif ensamblador.station == "ensamblaje" and ensamblador.carrying_plate and not ensamblador.carrying_plate.food:
-                # try assemble if ingredients ready
-                cort = [i for i in ingredients if i.state=="cortado" and not i.held]
-                lech = [i for i in cort if i.itype=="lechuga"]
-                tom = [i for i in cort if i.itype=="tomate"]
-                if lech and tom:
-                    ensamblador.carrying_plate.food = True
-                    ensamblador.carrying_plate.vis.color = color.rgb(255, 210, 60)
-                    lech[0].reset(); tom[0].reset()
-                    ensamblador.carrying_plate.drop(ensamblador.pos())
+    # Ensamblador
+    if ensamblador.carrying_plate and ensamblador.carrying_plate.food:
+        if ensamblador.station == "ensamblaje":
+            ensamblador.carrying_plate.drop(ensamblador.pos())
+        else:
+            _navigate(ensamblador, STATIONS["ensamblaje"])
+    elif not ensamblador.carrying_plate:
+        free_plates = [p for p in plates if not p.held and not p.food]
+        if free_plates:
+            _navigate(ensamblador, STATIONS["platos"])
+            if ensamblador.station == "platos": _try_pickup_plate(ensamblador)
+    elif ensamblador.station == "ensamblaje" and ensamblador.carrying_plate and not ensamblador.carrying_plate.food:
+        cort = [i for i in ingredients if i.state=="cortado" and not i.held]
+        lech = [i for i in cort if i.itype=="lechuga"]
+        tom = [i for i in cort if i.itype=="tomate"]
+        if lech and tom:
+            ensamblador.carrying_plate.food = True
+            ensamblador.carrying_plate.vis.color = color.rgb(255, 210, 60)
+            lech[0].reset(); tom[0].reset()
+            ensamblador.carrying_plate.drop(ensamblador.pos())
 
-    if not (getattr(repartidor, "_last_cmd_t", 0) and now - repartidor._last_cmd_t < 1.0):
-        assembled = [p for p in plates if p.food and not p.held]
-        if assembled and not repartidor.carrying_plate:
-            _navigate(repartidor, assembled[0].pos())
-            if (repartidor.pos() - assembled[0].pos()).length() < 1.5:
-                assembled[0].pickup(repartidor)
-        elif repartidor.carrying_plate:
-            _navigate(repartidor, STATIONS["entrega"])
+    # Repartidor
+    assembled = [p for p in plates if p.food and not p.held]
+    if assembled and not repartidor.carrying_plate:
+        _navigate(repartidor, assembled[0].pos())
+        if (repartidor.pos() - assembled[0].pos()).length() < 1.5:
+            assembled[0].pickup(repartidor)
+    elif repartidor.carrying_plate:
+        _navigate(repartidor, STATIONS["entrega"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  UPDATE (Ursina game loop)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def update():
-    global gemini_on, _last_g, _cmds
+    global gemini
     dt = utime.dt
     if dt <= 0 or dt > 0.1: return
 
@@ -669,34 +751,19 @@ def update():
 
     # ── Input ───────────────────────────────────────────────────────────
     if held_keys["r"]:
+        # Presionar R = nuevo escenario (Gemini o default)
+        print("[R] Generando nuevo escenario...")
+        cfg = gemini.generate_scenario()
+        scenario.apply(cfg)
         orders.reset(); orders.spawn()
         for r in robots: r.reset()
         for i in ingredients: i.reset()
         for p in plates: p.reset()
-    if held_keys["g"]:
-        gemini_on = not gemini_on
-        print(f"[Gemini] {'ON' if gemini_on else 'OFF'}")
+        gemini_txt.text = f"Gemini: {'ON' if gemini._ok else 'OFF'}"
+        gemini_txt.color = color.green if gemini._ok else color.red
 
     # ── Física ──────────────────────────────────────────────────────────
-    with _glock:
-        for _ in range(min(max(1, int(dt*240)), 8)): pw.step()
-
-    # ── Gemini (cada 3s) ────────────────────────────────────────────────
-    if gemini_on and gemini:
-        now = time.time()
-        if now - _last_g >= 3.0:
-            _last_g = now
-            st = _state()
-            def _call(): 
-                try:
-                    cmds = gemini.decide(st)
-                    if cmds:
-                        with _glock: _cmds.extend(cmds)
-                except Exception as e: print(f"[Gemini] thread: {e}")
-            threading.Thread(target=_call, daemon=True).start()
-
-    # ── Ejecutar comandos ───────────────────────────────────────────────
-    _apply_cmds()
+    for _ in range(min(max(1, int(dt*240)), 8)): pw.step()
 
     # ── Procesar ingredientes ───────────────────────────────────────────
     for ing in ingredients:
@@ -704,7 +771,7 @@ def update():
             ing.proc_t -= dt
             if ing.proc_t <= 0: ing.set_state("cortado"); ing.proc = False
 
-    # ── Pipeline (fallback sin Gemini) ──────────────────────────────────
+    # ── Pipeline automático ─────────────────────────────────────────────
     _pipeline()
 
     # ── Detectar entregas ───────────────────────────────────────────────
@@ -731,9 +798,6 @@ def update():
         a = r.action[:6]; s = r.station[:6]
         robot_ui[i].text = f"R{i} {r.role[:3].upper()} | {s} | {a} [{c}]"
     score_txt.text = f"SCORE: {orders.score} | PEDIDOS: {orders.pending}"
-    gc = color.green if gemini_on else color.red
-    gemini_txt.text = f"Gemini: {'ON' if gemini_on else 'OFF'}"
-    gemini_txt.color = gc
 
 # ══════════════════════════════════════════════════════════════════════════════
 
