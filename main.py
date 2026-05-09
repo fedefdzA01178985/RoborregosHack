@@ -20,7 +20,7 @@ import sys
 try:
     from ursina import (Ursina, Entity, Vec3, color, time as utime,
                         held_keys, Text, camera, window, DirectionalLight,
-                        AmbientLight, Sky)
+                        AmbientLight)
 except ImportError:
     print("[ERROR] Ursina no instalado. pip install ursina")
     sys.exit(1)
@@ -80,15 +80,19 @@ class RoboKitchen:
             size=CONFIG["window_size"],
             fullscreen=CONFIG["fullscreen"],
             development_mode=True,
+            borderless=False,
         )
         window.fps_counter.enabled = True
         window.exit_button.visible = False
-        camera.position = Vec3(0, 18, -5)
-        camera.rotation_x = 65
-        AmbientLight(color=color.rgba(160, 160, 180, 255))
-        sun = DirectionalLight()
-        sun.look_at(Vec3(1, -2, -1))
-        Sky(texture="sky_default")
+        window.color = color.rgb(15, 18, 25)
+
+        camera.position = Vec3(-1, 22, -12)
+        camera.rotation_x = 60
+        camera.fov = 55
+
+        AmbientLight(color=color.rgba(200, 200, 220, 255))
+        main_light = DirectionalLight()
+        main_light.look_at(Vec3(0.5, -1, -0.5))
 
     def _init_physics(self):
         self.physics = PhysicsWorld()
