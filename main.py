@@ -4,6 +4,7 @@ import heapq
 from math import degrees, atan2
 import json
 import urllib.request
+import os
 
 app = Ursina()
 
@@ -907,11 +908,15 @@ def actualizar_contador():
 def actualizar_score():
     score_text.text = f"⭐ Puntos: {score}"
 
-GEMINI_API_KEY = "AIzaSyDXk15jYt4WyaAMj8zOkFRnwrUysvupve0"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
 def call_gemini_for_scenario():
     """Llama a Gemini API para generar un escenario. Retorna dict o None."""
+    if not GEMINI_API_KEY:
+        print("[Gemini] Sin API key configurada — usando random manual")
+        return None
+
     prompt = (
         "Genera un escenario para un juego tipo Overcooked en una cuadrícula de 5x5 unidades. "
         "Necesito 6 estaciones pegadas a las paredes exteriores (no en el centro), "
@@ -950,7 +955,8 @@ def call_gemini_for_scenario():
         req = urllib.request.Request(
             GEMINI_URL,
             data=json.dumps(payload).encode('utf-8'),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json",
+                     "x-goog-api-key": GEMINI_API_KEY},
             method="POST"
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
